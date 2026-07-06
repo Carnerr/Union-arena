@@ -1,0 +1,47 @@
+{
+  "cards": [
+    {
+      "id": "private_card_id",
+      "number": "ABC-1-001",
+      "name": "Private Card Name",
+      "type": "Character",
+      "title": "Private Source Title",
+      "color": "Green",
+      "requiredEnergy": 1,
+      "apCost": 1,
+      "bp": 3000,
+      "energy": "Green:1",
+      "affinities": "Example Affinity",
+      "keywordEffect": "Step; Impact (1)",
+      "triggerEffect": "Get",
+      "abilities": [
+        {
+          "id": "private-main-ability",
+          "timing": "Activate: Main",
+          "oncePerTurn": true,
+          "conditions": { "line": "front" },
+          "cost": { "restSelf": true },
+          "effect": { "kind": "draw", "amount": 1 }
+        }
+      ]
+    },
+    {
+      "id": "private_event_id",
+      "number": "ABC-1-002",
+      "name": "Private Event Name",
+      "type": "Event",
+      "title": "Private Source Title",
+      "color": "Green",
+      "requiredEnergy": 1,
+      "apCost": 1,
+      "affinities": "",
+      "eventEffect": {
+        "kind": "sequence",
+        "effects": [
+          { "kind": "lookTopDeck", "count": 3 },
+          { "kind": "moveTopDeck", "count": 1, "destination": "hand" }
+        ]
+      }
+    }
+  ]
+}

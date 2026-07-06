@@ -1,0 +1,29 @@
+{
+  "name": "union-arena-local-engine",
+  "version": "0.1.0",
+  "description": "Dependency-free local rules engine scaffold for Union Arena-style gameplay.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "demo": "node examples/demo.mjs",
+    "import:catalog": "node tools/import-catalog.mjs",
+    "fetch:egman": "node tools/fetch-egman-unionarena.mjs",
+    "deck:import": "node tools/deck-library.mjs import",
+    "deck:import-folder": "node tools/import-deck-folder.mjs",
+    "deck:list": "node tools/deck-library.mjs list",
+    "deck:show": "node tools/deck-library.mjs show",
+    "simulate": "node tools/simulate-decks.mjs",
+    "simulate:batch": "node tools/batch-simulate.mjs",
+    "ai": "node tools/ai-engine.mjs",
+    "pilot:agent": "node tools/pilot-agent.mjs",
+    "deck:agent": "node tools/deck-agent.mjs",
+    "analyze:effects": "node tools/analyze-card-effects.mjs",
+    "audit:actions": "node tools/audit-action-effect-gaps.mjs",
+    "audit:costs": "node tools/audit-cost-restriction-gaps.mjs",
+    "audit:faq": "node tools/audit-official-faq.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
