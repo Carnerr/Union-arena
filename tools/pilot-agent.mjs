@@ -1,6 +1,8 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 import {
   DEFAULT_PILOT_POLICY,
   analyzeSetupHand,
@@ -24,10 +26,10 @@ const command = process.argv[2];
 try {
   switch (command) {
     case "evaluate":
-      evaluateCommand();
+      await evaluateCommand();
       break;
     case "train":
-      trainCommand();
+      await trainCommand();
       break;
     case "help":
     case "--help":
@@ -44,15 +46,16 @@ try {
   process.exit(1);
 }
 
-function evaluateCommand() {
+async function evaluateCommand() {
   const config = readConfig({
     outDir: option("--out-dir") ?? join(DEFAULT_OUT_DIR, `${timestamp()}-evaluate`)
   });
-  const deckId = requiredOption("--deck");
+  const deckId = await deckOptionOrPrompt(config.libraryDir);
   const deck = loadSavedDeck(config.libraryDir, deckId);
   const opponents = loadOpponents(config.libraryDir, opponentsText(deckId));
   const policy = loadPolicyOption("--policy") ?? normalizePilotPolicy();
   const opponentPolicy = loadPolicyOption("--opponent-policy") ?? normalizePilotPolicy();
+  const progress = createProgressReporter(config.progressIntervalMs);
   const evaluation = evaluatePolicy({
     catalog: config.catalog,
     deck: deck.cards,
@@ -65,7 +68,16 @@ function evaluateCommand() {
     maxActions: config.maxActions,
     policy,
     opponentPolicy,
-    candidateId: policy.name ?? "policy"
+    candidateId: policy.name ?? "policy",
+    progress,
+    progressContext: {
+      phase: "evaluate",
+      generation: null,
+      candidateIndex: 0,
+      populationSize: 1,
+      generationGameOffset: 0,
+      generationTotalGames: config.games * opponents.length
+    }
   });
 
   const report = buildReport({
@@ -88,11 +100,11 @@ function evaluateCommand() {
   printSummary(evaluation.summary);
 }
 
-function trainCommand() {
+async function trainCommand() {
   const config = readConfig({
     outDir: option("--out-dir") ?? join(DEFAULT_OUT_DIR, `${timestamp()}-train`)
   });
-  const deckId = requiredOption("--deck");
+  const deckId = await deckOptionOrPrompt(config.libraryDir);
   const deck = loadSavedDeck(config.libraryDir, deckId);
   const opponents = loadOpponents(config.libraryDir, opponentsText(deckId));
   const generations = Number(option("--generations") ?? 4);
@@ -104,6 +116,7 @@ function trainCommand() {
   const rng = makeRng(config.seed);
   const startingPolicy = loadPolicyOption("--policy") ?? normalizePilotPolicy();
   const opponentPolicy = loadPolicyOption("--opponent-policy") ?? normalizePilotPolicy();
+  const progress = createProgressReporter(config.progressIntervalMs);
 
   let population = seedPolicyPopulation(startingPolicy, rng, {
     populationSize,
@@ -115,6 +128,8 @@ function trainCommand() {
   let best = null;
 
   for (let generation = 0; generation <= generations; generation += 1) {
+    const generationTotalGames = population.length * config.games * opponents.length;
+    progress.startGeneration(generation, generationTotalGames, population.length);
     const evaluated = population.map((policy, index) => {
       const candidateId = `g${generation}-p${index}`;
       const evaluation = evaluatePolicy({
@@ -129,7 +144,16 @@ function trainCommand() {
         maxActions: config.maxActions,
         policy: { ...policy, name: candidateId },
         opponentPolicy,
-        candidateId
+        candidateId,
+        progress,
+        progressContext: {
+          phase: "train",
+          generation,
+          candidateIndex: index,
+          populationSize: population.length,
+          generationGameOffset: index * config.games * opponents.length,
+          generationTotalGames
+        }
       });
       const row = {
         generation,
@@ -178,7 +202,16 @@ function trainCommand() {
     maxActions: config.maxActions,
     policy: startingPolicy,
     opponentPolicy,
-    candidateId: "baseline"
+    candidateId: "baseline",
+    progress,
+    progressContext: {
+      phase: "final-baseline",
+      generation: "final",
+      candidateIndex: 0,
+      populationSize: 2,
+      generationGameOffset: 0,
+      generationTotalGames: finalGames * opponents.length * 2
+    }
   });
   const finalEvaluation = evaluatePolicy({
     catalog: config.catalog,
@@ -192,7 +225,16 @@ function trainCommand() {
     maxActions: config.maxActions,
     policy: { ...best.policy, name: "best-policy" },
     opponentPolicy,
-    candidateId: "best-policy"
+    candidateId: "best-policy",
+    progress,
+    progressContext: {
+      phase: "final-best",
+      generation: "final",
+      candidateIndex: 1,
+      populationSize: 2,
+      generationGameOffset: finalGames * opponents.length,
+      generationTotalGames: finalGames * opponents.length * 2
+    }
   });
 
   const finalRankings = [
@@ -250,7 +292,8 @@ function readConfig({ outDir }) {
     validateDecks: !hasFlag("--no-validate"),
     autoMulliganBricks: hasFlag("--auto-mulligan-bricks"),
     maxTurns: Number(option("--max-turns") ?? 80),
-    maxActions: Number(option("--max-actions") ?? 1000)
+    maxActions: Number(option("--max-actions") ?? 1000),
+    progressIntervalMs: progressIntervalMs()
   };
 }
 
@@ -266,12 +309,18 @@ function evaluatePolicy({
   maxActions,
   policy,
   opponentPolicy,
-  candidateId
+  candidateId,
+  progress,
+  progressContext = {}
 }) {
   const rows = [];
   let index = 0;
+  let wins = 0;
+  let losses = 0;
+  let incomplete = 0;
   const normalizedPolicy = normalizePilotPolicy(policy);
   const normalizedOpponentPolicy = normalizePilotPolicy(opponentPolicy);
+  const totalEvaluationGames = games * opponents.length;
 
   for (const opponent of opponents) {
     for (let game = 0; game < games; game += 1) {
@@ -298,6 +347,9 @@ function evaluatePolicy({
         index: index + 1,
         seed: gameSeed
       });
+      if (result.winner === "P1") wins += 1;
+      else if (result.winner === "P2") losses += 1;
+      else incomplete += 1;
       rows.push({
         ...result,
         opponent: opponent.id,
@@ -307,6 +359,18 @@ function evaluatePolicy({
         playoutStoppedReason: playout.stoppedReason
       });
       index += 1;
+      progress?.maybe({
+        ...progressContext,
+        candidateId,
+        opponent: opponent.id,
+        gameInCandidate: index,
+        totalCandidateGames: totalEvaluationGames,
+        generationGame: Number(progressContext.generationGameOffset ?? 0) + index,
+        generationTotalGames: progressContext.generationTotalGames ?? totalEvaluationGames,
+        wins,
+        losses,
+        incomplete
+      });
     }
   }
 
@@ -323,6 +387,69 @@ function resolveBrickMulligans(state) {
     nextState = applyAction(nextState, { type: actionType, player: playerId });
   }
   return nextState;
+}
+
+function progressIntervalMs() {
+  if (hasFlag("--no-progress")) return 0;
+  const explicitMs = option("--progress-interval-ms");
+  if (explicitMs !== undefined) return Math.max(0, Number(explicitMs));
+  const seconds = option("--progress-seconds");
+  if (seconds !== undefined) return Math.max(0, Number(seconds) * 1000);
+  const minutes = option("--progress-minutes");
+  if (minutes !== undefined) return Math.max(0, Number(minutes) * 60_000);
+  return 120_000;
+}
+
+function createProgressReporter(intervalMs) {
+  const enabled = Number.isFinite(intervalMs) && intervalMs > 0;
+  const startedAt = Date.now();
+  let nextAt = startedAt + intervalMs;
+
+  return {
+    startGeneration(generation, totalGames, populationSize) {
+      if (!enabled) return;
+      nextAt = Date.now() + intervalMs;
+      console.log(`[${clockTime()}] Generation ${generation}: started 0/${totalGames} games (${populationSize} policies)`);
+    },
+    maybe(event) {
+      if (!enabled) return;
+      const now = Date.now();
+      const generationGame = Number(event.generationGame ?? event.gameInCandidate ?? 0);
+      const generationTotalGames = Number(event.generationTotalGames ?? event.totalCandidateGames ?? 0);
+      if (now < nextAt && generationGame !== generationTotalGames) return;
+      nextAt = now + intervalMs;
+      const candidate = event.candidateId
+        ? ` | Candidate ${event.candidateId} (${Number(event.candidateIndex ?? 0) + 1}/${event.populationSize ?? 1})`
+        : "";
+      const candidateGame = event.totalCandidateGames
+        ? ` | Candidate game ${event.gameInCandidate}/${event.totalCandidateGames}`
+        : "";
+      const opponent = event.opponent ? ` | Opponent ${event.opponent}` : "";
+      const record = ` | W/L/I ${event.wins}/${event.losses}/${event.incomplete}`;
+      console.log(`[${clockTime(now)}] ${progressLabel(event)}: Game ${generationGame}/${generationTotalGames}${candidate}${candidateGame}${opponent}${record} | elapsed ${durationText(now - startedAt)}`);
+    }
+  };
+}
+
+function progressLabel(event) {
+  if (event.phase === "evaluate") return "Evaluate";
+  if (event.phase === "final-baseline") return "Final baseline";
+  if (event.phase === "final-best") return "Final best policy";
+  return `Generation ${event.generation}`;
+}
+
+function clockTime(date = Date.now()) {
+  return new Date(date).toLocaleTimeString();
+}
+
+function durationText(ms) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
 }
 
 function summarizeRows(rows) {
@@ -575,6 +702,93 @@ function loadOpponents(libraryDir, text) {
     .map((id) => loadSavedDeck(libraryDir, id));
 }
 
+async function deckOptionOrPrompt(libraryDir) {
+  const explicit = option("--deck");
+  if (explicit) return explicit;
+
+  const decks = readSavedDeckIndex(libraryDir);
+  if (decks.length === 0) throw new Error(`No saved decks found in ${libraryDir}.`);
+
+  console.log("Saved decks:");
+  decks.forEach((deck, index) => {
+    console.log(`${String(index + 1).padStart(2, " ")}. ${deck.id} - ${deck.name}`);
+  });
+
+  const rl = createInterface({ input, output });
+  try {
+    while (true) {
+      const answer = (await rl.question("Deck to use (number, deck ID, or search text): ")).trim();
+      const selected = resolveDeckAnswer(answer, decks);
+      if (selected) return selected.id;
+
+      const matches = deckSearchMatches(answer, decks);
+      if (matches.length > 1) {
+        console.log(`Matched ${matches.length} decks. Narrow it down or choose one of these numbers:`);
+        matches.slice(0, 20).forEach((deck) => {
+          const index = decks.findIndex((candidate) => candidate.id === deck.id);
+          console.log(`${String(index + 1).padStart(2, " ")}. ${deck.id} - ${deck.name}`);
+        });
+        if (matches.length > 20) console.log(`...and ${matches.length - 20} more.`);
+      } else {
+        console.log("I couldn't match that deck. Try a number from the list or paste the deck ID.");
+      }
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+function readSavedDeckIndex(libraryDir) {
+  if (!existsSync(libraryDir)) return [];
+  return readdirSync(libraryDir)
+    .filter((file) => file.toLowerCase().endsWith(".json"))
+    .map((file) => {
+      try {
+        const raw = JSON.parse(readFileSync(join(libraryDir, file), "utf8"));
+        if (!raw.id || !Array.isArray(raw.cards)) return null;
+        return {
+          id: raw.id,
+          name: raw.name ?? raw.id,
+          path: join(libraryDir, file)
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
+function resolveDeckAnswer(answer, decks) {
+  if (!answer) return null;
+  const numeric = Number(answer);
+  if (Number.isInteger(numeric) && numeric >= 1 && numeric <= decks.length) {
+    return decks[numeric - 1];
+  }
+
+  const normalized = normalizeSearch(answer);
+  const exact = decks.find((deck) => {
+    return normalizeSearch(deck.id) === normalized || normalizeSearch(deck.name) === normalized;
+  });
+  if (exact) return exact;
+
+  const matches = deckSearchMatches(answer, decks);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function deckSearchMatches(answer, decks) {
+  const terms = normalizeSearch(answer).split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return [];
+  return decks.filter((deck) => {
+    const text = normalizeSearch(`${deck.id} ${deck.name}`);
+    return terms.every((term) => text.includes(term));
+  });
+}
+
+function normalizeSearch(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 function opponentsText(fallback) {
   const file = option("--opponents-file");
   if (file) return readFileSync(file, "utf8");
@@ -659,15 +873,6 @@ function option(flag) {
   return index === -1 ? undefined : process.argv[index + 1];
 }
 
-function requiredOption(flag) {
-  const value = option(flag);
-  if (!value) {
-    usage();
-    throw new Error(`Missing required option: ${flag}`);
-  }
-  return value;
-}
-
 function hasFlag(flag) {
   return process.argv.includes(flag);
 }
@@ -678,14 +883,19 @@ function timestamp() {
 
 function usage() {
   console.log(`Usage:
-  node tools/pilot-agent.mjs evaluate --deck deck-id --opponents opp-a,opp-b [--policy path] [--games 50]
-  node tools/pilot-agent.mjs train --deck deck-id --opponents opp-a,opp-b [--generations 4] [--population 8] [--games 12]
+  node tools/pilot-agent.mjs evaluate [--deck deck-id] --opponents opp-a,opp-b [--policy path] [--games 50]
+  node tools/pilot-agent.mjs train [--deck deck-id] --opponents opp-a,opp-b [--generations 4] [--population 8] [--games 12]
   node tools/pilot-agent.mjs train --deck deck-id --opponents-file work/private/deck-gauntlets/regional-q1-2026.txt --seed 1001 --out-dir work/private/pilot-agent/session-1001
+
+Leave out --deck to choose from a numbered list of saved decks before the run starts.
 
 Useful options:
   --auto-mulligan-bricks
   --policy path/to/starting-policy.json
   --opponent-policy path/to/opponent-policy.json
+  --progress-minutes 2
+  --progress-seconds 30
+  --no-progress
   --final-games 50
   --mutation-scale 80
   --mutation-rate 0.35

@@ -10,10 +10,12 @@ Evaluate the baseline pilot:
 node tools/pilot-agent.mjs evaluate --deck user-eva-033-test --opponents regional-slg-purple-spencer-1-peoria-illinois --games 50 --auto-mulligan-bricks --out-dir work/private/pilot-agent/eva-baseline-vs-spencer-50
 ```
 
+You can omit `--deck` to pick from saved decks interactively before the run starts.
+
 Train a pilot:
 
 ```powershell
-node tools/pilot-agent.mjs train --deck user-eva-033-test --opponents regional-slg-purple-spencer-1-peoria-illinois --games 20 --final-games 100 --generations 6 --population 10 --elite 2 --seed 1001 --auto-mulligan-bricks --out-dir work/private/pilot-agent/eva-spencer-seed-1001
+node tools/pilot-agent.mjs train --deck user-eva-033-test --opponents regional-slg-purple-spencer-1-peoria-illinois --games 20 --final-games 100 --generations 6 --population 10 --elite 2 --seed 1001 --auto-mulligan-bricks --progress-minutes 2 --out-dir work/private/pilot-agent/eva-spencer-seed-1001
 ```
 
 Use the best policy from a prior run:
@@ -39,6 +41,17 @@ node tools/pilot-agent.mjs train --deck user-eva-033-test --opponents regional-s
 ```
 
 Compare `analysis.md`, `rankings.csv`, and `best-policy.json` from each run. The strongest policy can become the starting point for a broader run by passing it with `--policy`.
+
+## Progress Updates
+
+Training prints timed progress updates by default every two minutes. Change the interval with:
+
+```powershell
+--progress-minutes 3
+--progress-seconds 30
+```
+
+Disable timed updates with `--no-progress`.
 
 ## Output Files
 
