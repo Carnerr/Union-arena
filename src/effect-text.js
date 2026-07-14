@@ -1,4 +1,6 @@
-import { CARD_TYPES, LINES, TIMINGS, TRIGGER_TYPES } from "./constants.js";
+import { CARD_TYPES, LINES, MAX_LINE_SIZE, TIMINGS, TRIGGER_TYPES } from "./constants.js";
+import { rlyCardEncodingOverride } from "./card-overrides/rly.js";
+import { auditedCardEncodingOverride } from "./card-overrides/audited.js";
 
 const NUMBER_WORDS = new Map([
   ["zero", 0],
@@ -64,6 +66,36 @@ export function encodeEgmanCardText(card) {
   const triggerText = cleanUnionArenaText(card.trigger);
   const unsupported = [];
   const encoded = {};
+  encoded.replaceParsedKeywords = true;
+
+  const deckCopyLimit = parseDeckCopyLimit(effectText);
+  if (deckCopyLimit !== undefined) encoded.deckCopyLimit = deckCopyLimit;
+
+  const maximumHandSize = parseMaximumHandSize(effectText);
+  if (maximumHandSize !== undefined) encoded.maximumHandSize = maximumHandSize;
+
+  const alternateNames = parseAlternateNames(effectText);
+  if (alternateNames.length > 0) encoded.alternateNames = alternateNames;
+
+  const lineCapacityModifiers = parseLineCapacityModifiers(effectText);
+  if (lineCapacityModifiers.length > 0) encoded.lineCapacityModifiers = lineCapacityModifiers;
+
+  if (/this character can only be played by performing raid with it/i.test(effectText)) {
+    encoded.raidOnlyPlay = true;
+  }
+
+  const abilityProtections = parseStaticAbilityProtections(effectText);
+  if (abilityProtections.length > 0) encoded.abilityProtections = abilityProtections;
+
+  const targetingRestrictions = parseSelfTargetingRestrictions(effectText);
+  if (targetingRestrictions.length > 0) encoded.targetingRestrictions = targetingRestrictions;
+
+  if (/this character cannot be removed from the field by your opponent's abilities/i.test(effectText)) {
+    encoded.opponentAbilityRemovalProtection = true;
+  }
+  if (/this character cannot be returned to your hand by your or your opponent's abilities/i.test(effectText)) {
+    encoded.abilityReturnToHandProtection = true;
+  }
 
   const trigger = encodeTriggerText(triggerText);
   if (trigger.trigger) encoded.triggerEffect = trigger.trigger;
@@ -71,6 +103,12 @@ export function encodeEgmanCardText(card) {
 
   const raid = parseRaidDefinition(effectText);
   if (raid) encoded.raid = raid;
+
+  const raidUseCondition = parseRaidUseCondition(effectText);
+  if (raidUseCondition) encoded.raidUseCondition = raidUseCondition;
+
+  const raidTargetPermissions = parseRaidTargetPermissions(effectText);
+  if (raidTargetPermissions.length > 0) encoded.raidTargetPermissions = raidTargetPermissions;
 
   if (/if this character is returned from your field to your hand,\s*return this raided character and its base card to your hand instead/i.test(effectText)) {
     encoded.returnRaidStackToHandOnReturn = true;
@@ -82,6 +120,30 @@ export function encodeEgmanCardText(card) {
 
   if (/opponent's characters that lose to this character in battle are placed into their removal area instead of being sidelined/i.test(effectText)) {
     encoded.battleLosersToRemovalInstead = true;
+  }
+  if (/opponent's characters that lose to this character in battle move to their energy line instead of being sidelined/i.test(effectText)) {
+    encoded.battleLosersToEnergyInstead = true;
+  }
+
+  if (/\[if on (?:the )?front line\]\s*you may perform an extra draw without paying ap/i.test(effectText)) {
+    encoded.freeExtraDrawFromFrontLine = true;
+  }
+
+  if (/if you activate this card's \[get trigger\] ability,\s*you may change it to a \[draw trigger\] or \[active trigger\] ability instead/i.test(effectText)) {
+    encoded.selfTriggerAlternatives = [
+      encodeTriggerText("[Draw]").trigger,
+      encodeTriggerText("[Active]").trigger
+    ];
+  }
+
+  const namedLeaveReplacement = effectText.match(/\[During Your Turn\]\s*(?<line>\[If on (?:the )?Front Line\]\s*)?If an? <(?<name>[^>]+)> leaves your field due to one of your opponent's abilities,\s*you may sideline this active character instead/i);
+  if (namedLeaveReplacement) {
+    encoded.opponentAbilityLeaveReplacement = {
+      protectedName: namedLeaveReplacement.groups.name,
+      requiresActive: true,
+      during: "controllerTurn",
+      ...(namedLeaveReplacement.groups.line ? { line: LINES.FRONT } : {})
+    };
   }
 
   if (/\[during your turn\]\s*if this character is returned from your field to your hand,\s*you may place one card from your hand into your sideline instead/i.test(effectText)) {
@@ -105,8 +167,28 @@ export function encodeEgmanCardText(card) {
     encoded.moveToEnergyInsteadOnOpponentAbilityBpReduction = true;
   }
 
-  if (/this card cannot be played onto or moved to your front line/i.test(effectText)) {
-    encoded.cannotEnterFrontLine = true;
+  const unconditionalFrontRestriction = /this (?:card|character) cannot be played onto or moved to your front line(?! unless)/i.test(effectText);
+  if (unconditionalFrontRestriction) encoded.cannotEnterFrontLine = true;
+  if (/this (?:card|character) cannot be played onto or moved to your energy line/i.test(effectText)) {
+    encoded.cannotEnterEnergyLine = true;
+  }
+  if (/this (?:card|character) cannot be played onto your front line/i.test(effectText)
+    && !/cannot be played onto or moved to your front line/i.test(effectText)) {
+    encoded.cannotPlayToFrontLine = true;
+  }
+  if (/this (?:card|character) cannot be played onto your energy line/i.test(effectText)
+    && !/cannot be played onto or moved to your energy line/i.test(effectText)) {
+    encoded.cannotPlayToEnergyLine = true;
+  }
+  if (/cannot be played onto your front line or move during your move(?:ment)? phase/i.test(effectText)) {
+    encoded.cannotPlayToFrontLine = true;
+    encoded.cannotMoveDuringMovementPhase = true;
+  }
+  if (/can only be moved to your front line using its ability/i.test(effectText)) {
+    encoded.frontLineMoveByOwnAbilityOnly = true;
+  }
+  if (/cannot be played onto or moved to your front line unless you have 20 or more cards in your sideline/i.test(effectText)) {
+    encoded.frontLineEntryCondition = { sidelineCountMin: 20 };
   }
 
   const whenUsingActive = compactEffectText(effectText).match(/when using this card,\s*you may (?<cost>place one .+? from your hand into your sideline)\.\s*if you do,\s*play this character set to active onto your field/i);
@@ -124,7 +206,10 @@ export function encodeEgmanCardText(card) {
     unsupported.push(...cost.unsupported);
   }
 
-  const staticKeywords = parseStaticKeywords(effectText);
+  const staticKeywords = {
+    ...parsePrintedKeywords(effectText),
+    ...parseStaticKeywords(effectText)
+  };
   if (/not affected by bp-reducing abilities/i.test(effectText)) {
     staticKeywords.bpReductionProtection = true;
   }
@@ -173,6 +258,7 @@ export function encodeEgmanCardText(card) {
     unsupported.push(...event.unsupported);
   } else {
     const abilities = parseAbilitySections(effectText, { cardName: card.name });
+    abilities.abilities.push(...parseStaticGrantedTimingAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseLeaveFieldCostReductionAbilities(effectText, { cardName: card.name }));
     abilities.abilities.push(...parseLeaveFieldTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseDeckToSidelineTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
@@ -184,6 +270,7 @@ export function encodeEgmanCardText(card) {
     abilities.abilities.push(...parseFieldMovementTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseOpponentActivateMainTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseCharacterSidelinedTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
+    abilities.abilities.push(...parseOwnCharacterSidelinedAbilityGrants(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseReturnedToHandTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseStartOfTurnTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseRaidedTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
@@ -192,9 +279,13 @@ export function encodeEgmanCardText(card) {
     abilities.abilities.push(...parseAttackPhaseTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseHandStartAttackPhaseTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     abilities.abilities.push(...parseLifeToSidelineTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
+    abilities.abilities.push(...parseBpIncreasedTriggeredAbilities(effectText, { cardName: card.name, unsupported }));
     if (abilities.abilities.length > 0) encoded.abilities = abilities.abilities;
     unsupported.push(...abilities.unsupported);
   }
+
+  const exactCardOverride = rlyCardEncodingOverride(card) ?? auditedCardEncodingOverride(card);
+  if (exactCardOverride) Object.assign(encoded, exactCardOverride);
 
   return {
     fields: encoded,
@@ -204,6 +295,201 @@ export function encodeEgmanCardText(card) {
       unsupported
     }
   };
+}
+
+function parsePrintedKeywords(rawText) {
+  const text = compactEffectText(rawText);
+  const keywords = {};
+  const pattern = /\[(Step|Snipe|Double Block|Double Attack|Nullify Impact|Impact\s*\(\s*\+?\d+\s*\)|Damage\s*\(\s*\+?\d+\s*\))\]/gi;
+  for (const match of text.matchAll(pattern)) {
+    if (insideDelimitedText(text, match.index, '"', '"') || insideDelimitedText(text, match.index, "(", ")")) continue;
+    const prefix = text.slice(Math.max(0, match.index - 80), match.index).toLowerCase();
+    if (/(?:gains?|loses?|has|have|with|without|by|using|activate|activated|includes?)\s*$/.test(prefix)) continue;
+
+    const tag = match[1].toLowerCase().replace(/\s+/g, " ");
+    if (tag === "step") keywords.step = true;
+    else if (tag === "snipe") keywords.snipe = true;
+    else if (tag === "double block") keywords.doubleBlock = true;
+    else if (tag === "double attack") keywords.doubleAttack = true;
+    else if (tag === "nullify impact") keywords.nullifyImpact = true;
+    else {
+      const value = tag.match(/(impact|damage)\s*\(\s*(\+?)(\d+)\s*\)/);
+      if (!value) continue;
+      const keyword = value[1] === "impact"
+        ? (value[2] ? "impactPlus" : "impact")
+        : (value[2] ? "damagePlus" : "damage");
+      keywords[keyword] = Number(value[3]);
+    }
+  }
+  return keywords;
+}
+
+function insideDelimitedText(text, index, open, close) {
+  if (open === close) {
+    return (text.slice(0, index).match(new RegExp(`\\${open}`, "g")) ?? []).length % 2 === 1;
+  }
+  let depth = 0;
+  for (let cursor = 0; cursor < index; cursor += 1) {
+    if (text[cursor] === open) depth += 1;
+    if (text[cursor] === close && depth > 0) depth -= 1;
+  }
+  return depth > 0;
+}
+
+function numberInRuleText(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (/^\d+$/.test(normalized)) return Number(normalized);
+  return NUMBER_WORDS.get(normalized);
+}
+
+function parseDeckCopyLimit(rawText) {
+  const match = cleanUnionArenaText(rawText).match(/a deck can (?:only )?contain up to\s+(\d+|[a-z]+)\s+copies of this card/i);
+  return match ? numberInRuleText(match[1]) : undefined;
+}
+
+function parseMaximumHandSize(rawText) {
+  const match = cleanUnionArenaText(rawText).match(/your maximum hand size is now\s+(\d+|[a-z]+)\s+cards/i);
+  return match ? numberInRuleText(match[1]) : undefined;
+}
+
+function parseAlternateNames(rawText) {
+  const text = compactEffectText(rawText);
+  const match = text.match(/this card is also treated as\s+((?:<[^>]+>(?:\s*(?:,|and)\s*)?)+)\./i);
+  if (!match) return [];
+  return [...match[1].matchAll(/<([^>]+)>/g)].map((nameMatch) => nameMatch[1]);
+}
+
+function parseRaidUseCondition(rawText) {
+  const text = compactEffectText(rawText);
+  const match = text.match(/you can only perform raid with this card if (.+?) (?:is|are) on your field\./i);
+  if (!match) return undefined;
+
+  const alternatives = [];
+  for (const nameMatch of match[1].matchAll(/<([^>]+)>/g)) {
+    alternatives.push({ fieldCountMin: 1, filter: { name: nameMatch[1] } });
+  }
+  for (const affinityMatch of match[1].matchAll(/\[([^\]]+)\]\s+affinity card/gi)) {
+    alternatives.push({ fieldCountMin: 1, filter: { affinity: affinityMatch[1] } });
+  }
+  if (alternatives.length === 0) return undefined;
+  return alternatives.length === 1 ? alternatives[0] : { anyOf: alternatives };
+}
+
+function parseRaidTargetPermissions(rawText) {
+  const text = staticTextBeforeAbilities(rawText);
+  const permissions = [];
+  for (const match of text.matchAll(/your\s+(?:(?:<([^>]+)>|character)\s+)?cards? with \[raid\] can perform raid on this character( with their trigger abilities)?\./gi)) {
+    permissions.push({
+      sourceFilter: match[1] ? { name: match[1] } : { type: CARD_TYPES.CHARACTER },
+      ...(match[2] ? { sourceKind: "trigger" } : {})
+    });
+  }
+  return permissions;
+}
+
+function parseLineCapacityModifiers(rawText) {
+  const modifiers = [];
+  const text = cleanUnionArenaText(rawText);
+  for (const match of text.matchAll(/\[if on (?:the )?(front line|energy line)\]\s*the number of cards you can place onto your (front line|energy line) is (reduced|increased) by\s+(\d+|[a-z]+)/gi)) {
+    const amount = numberInRuleText(match[4]);
+    if (amount === undefined) continue;
+    modifiers.push({
+      line: match[2].toLowerCase().startsWith("front") ? LINES.FRONT : LINES.ENERGY,
+      amount: match[3].toLowerCase() === "reduced" ? -amount : amount,
+      condition: {
+        line: match[1].toLowerCase().startsWith("front") ? LINES.FRONT : LINES.ENERGY
+      }
+    });
+  }
+  return modifiers;
+}
+
+function abilityProtectionFromText(rawText) {
+  const text = compactEffectText(rawText).toLowerCase();
+  const actions = [];
+  if (/cannot be sidelined\b/.test(text)) actions.push("sideline");
+  if (/cannot be (?:switched|set) to resting\b/.test(text)) actions.push("rest");
+  if (/cannot be (?:switched to resting, )?moved\b/.test(text)) actions.push("move");
+  if (/this character cannot be [^.]*returned to your hand\b/.test(text)) actions.push("returnToHand");
+  if (/cannot be [^.]*affected by bp-reducing abilities|not affected by bp-reducing abilities/.test(text)) {
+    actions.push("bpReduction");
+  }
+  if (actions.length === 0) return undefined;
+
+  const sourceScope = text.match(/cannot be sidelined by ([^."]+)/)?.[1] ?? "";
+  const sourceTypes = [];
+  if (/abilities on (?:your opponent's )?characters?|opponent's character abilities/.test(sourceScope)) {
+    sourceTypes.push(CARD_TYPES.CHARACTER);
+  }
+  if (/event cards?|event card abilities/.test(sourceScope)) sourceTypes.push(CARD_TYPES.EVENT);
+  if (/site cards?|site abilities/.test(sourceScope)) sourceTypes.push(CARD_TYPES.SITE);
+  if (/trigger abilities/.test(sourceScope)) sourceTypes.push("trigger");
+
+  return {
+    actions: [...new Set(actions)],
+    source: !/your or your opponent's abilities/.test(text)
+      && /your opponent's abilities|abilities on your opponent's/.test(text) ? "opponent" : "any",
+    ...(sourceTypes.length > 0 ? { sourceTypes: [...new Set(sourceTypes)] } : {}),
+    ...(text.includes("[during opponent's turn]") ? { during: "opponentTurn" } : {}),
+    ...(text.includes("[during your turn]") ? { during: "controllerTurn" } : {})
+  };
+}
+
+function parseStaticAbilityProtections(rawText) {
+  const text = compactEffectText(rawText);
+  const candidates = [staticTextBeforeAbilities(rawText)];
+  for (const match of text.matchAll(/(?:\[During (?:Your|Opponent's) Turn\]\s*)?This character cannot be [^.]+\./gi)) {
+    if (!insideDelimitedText(text, match.index, '"', '"')) candidates.push(match[0]);
+  }
+  for (const match of text.matchAll(/(?:\[During (?:Your|Opponent's) Turn\]\s*)?This character is not affected by BP-reducing abilities\./gi)) {
+    if (!insideDelimitedText(text, match.index, '"', '"')) candidates.push(match[0]);
+  }
+  const protections = candidates.map(abilityProtectionFromText).filter(Boolean);
+  return protections.filter((protection, index) => protections.findIndex((candidate) => (
+    JSON.stringify(candidate) === JSON.stringify(protection)
+  )) === index);
+}
+
+function targetingRestrictionFromText(rawText) {
+  const text = compactEffectText(rawText).toLowerCase();
+  if (!text.includes("cannot choose this character") && !text.includes("cannot be chosen")) return undefined;
+  if (!text.includes("opponent")) return undefined;
+
+  const sourceTypes = [];
+  if (/character(?: card)? abilities|abilities on (?:your opponent's )?characters?|ability on a character|opponent's character|character,|character or/.test(text)) {
+    sourceTypes.push(CARD_TYPES.CHARACTER);
+  }
+  if (/event card abilities|abilities on event cards?|ability on an event card|event card,|or event/.test(text)) {
+    sourceTypes.push(CARD_TYPES.EVENT);
+  }
+  if (/site(?: card)? abilities|abilities on sites?|site,/.test(text)) sourceTypes.push(CARD_TYPES.SITE);
+  if (/trigger abilities|trigger\b/.test(text)) sourceTypes.push("trigger");
+  if (sourceTypes.length === 0) {
+    sourceTypes.splice(0, sourceTypes.length, CARD_TYPES.CHARACTER, CARD_TYPES.EVENT, CARD_TYPES.SITE, "trigger");
+  }
+
+  const restriction = {
+    mode: text.includes("unless they pay") || text.includes("unless they place") ? "tax" : "prohibit",
+    sourceTypes: [...new Set(sourceTypes)]
+  };
+  if (text.includes("unless they pay 1 ap")) restriction.payment = { kind: "ap", amount: 1 };
+  if (text.includes("unless they place one card from their hand into their sideline")) {
+    restriction.payment = { kind: "handToSideline", amount: 1 };
+  }
+  if (/event cards? your opponent uses from their hand/.test(text)) restriction.sourceZone = "hand";
+  if (text.includes("[during opponent's turn]")) restriction.during = "opponentTurn";
+  if (text.includes("[during your turn]")) restriction.during = "controllerTurn";
+  if (/characters? that (?:are|is) not raided/.test(text)) restriction.sourceRaided = false;
+  const sourceBp = text.match(/opponent's characters? with (\d+) or more bp/);
+  if (sourceBp) restriction.sourceBpMin = Number(sourceBp[1]);
+  return restriction;
+}
+
+function parseSelfTargetingRestrictions(rawText) {
+  const text = staticTextBeforeAbilities(rawText);
+  const selfSentence = text.match(/(?:your opponent cannot choose this (?:character|site)[^.]*|this (?:character|site) cannot be chosen by[^.]*opponent[^.]*)/i);
+  const restriction = selfSentence ? targetingRestrictionFromText(selfSentence[0]) : undefined;
+  return restriction ? [restriction] : [];
 }
 
 export function encodeTriggerText(rawText) {
@@ -407,7 +693,41 @@ function parseAbilitySections(rawText, context = {}) {
   return { abilities, unsupported };
 }
 
+function parseStaticGrantedTimingAbilities(rawText, context = {}) {
+  const text = compactEffectText(rawText);
+  const unsupported = context.unsupported ?? [];
+  const abilities = [];
+  if (!text) return abilities;
+
+  const pattern = /^(?<condition>if [^,]+),\s*(?:this character|it) gains [^"]*?\band\s*"\s*\[(?<timing>when played|when attacking|when blocking|when sidelined|activate: main|start of end phase)\]\s*(?<body>[^"]+?)"\s+until (?:the end of the turn|the start of your next turn)\.?/i;
+  const match = text.match(pattern);
+  if (!match) return abilities;
+
+  const condition = parseConditionOnly(match.groups.condition.toLowerCase());
+  const timing = TIMING_MAP.get(match.groups.timing.toLowerCase());
+  if (!condition || !timing) return abilities;
+
+  const encoded = encodeEffectBody(match.groups.body.replace(/\.$/, "").trim(), {
+    ...context,
+    allowChoice: false,
+    defaultTarget: "self"
+  });
+  unsupported.push(...encoded.unsupported);
+  if (!encoded.effect || encoded.effect.kind === "none" || encoded.effect.kind === "unsupported") return abilities;
+
+  abilities.push({
+    id: `${timing}-${context.cardName ?? "card"}-conditional-grant`,
+    timing,
+    oncePerTurn: false,
+    conditions: condition,
+    effect: encoded.effect
+  });
+  return abilities;
+}
+
 function isEmbeddedTimingTag(text, index) {
+  const quoteCount = (text.slice(0, index).match(/"/g) ?? []).length;
+  if (quoteCount % 2 === 1) return true;
   const prefix = text.slice(Math.max(0, index - 40), index).toLowerCase();
   return /(?:['’]s|its|one|all|an?|the chosen character's|this character's)\s*$/.test(prefix);
 }
@@ -502,7 +822,19 @@ function parseAbilityCost(body) {
 
   if (/\[Once Per Turn\]/i.test(remaining)) {
     oncePerTurn = true;
-    remaining = remaining.replace(/\[Once Per Turn\]/gi, "");
+    remaining = remaining.replace(/\[Once Per Turn\]/gi, "").trim();
+  }
+
+  const namedDiscardCostMatch = remaining.match(/^Place\s+(\w+|\d+)\s+card with "([^"]+)"(?: or "([^"]+)")? in its card name from your hand into your sideline\.\s*If you do,\s*/i);
+  if (namedDiscardCostMatch) {
+    cost.discardFromHand = numberFromText(namedDiscardCostMatch[1], 1);
+    cost.discardFromHandFilter = {
+      anyOf: [namedDiscardCostMatch[2], namedDiscardCostMatch[3]]
+        .filter(Boolean)
+        .map((namePart) => ({ nameIncludesAll: [namePart] }))
+    };
+    cost.discardChoiceKey = "abilityDiscardHandIndexes";
+    remaining = remaining.replace(namedDiscardCostMatch[0], "");
   }
 
   return {
@@ -578,8 +910,31 @@ function parseLeaveFieldTriggeredAbilities(rawText, context = {}) {
     });
   }
 
+  const grantedMovementPattern = /(?<prefix>(?:\[[^\]]+\]\s*)*)when this character moves outside of your movement phase,\s*(?<body>(?:it|this character) gains?\s+"\s*\[(?:when played|when attacking|when blocking|when sidelined|activate: main|start of end phase)\][^"]+"\s+until (?:the end of the turn|the start of your next turn))\.?/gi;
+  let remainingSelfTriggerText = text;
+  for (const match of text.matchAll(grantedMovementPattern)) {
+    const prefix = match.groups.prefix ?? "";
+    const parsedCost = parseAbilityCost(`${prefix} ${match.groups.body ?? ""}`.trim());
+    const conditions = { movedPermanentSelf: true, ...(parsedCost.conditions ?? {}) };
+    if (/\[During Your Turn\]/i.test(prefix)) conditions.turn = "controller";
+    if (/\[During Opponent's Turn\]/i.test(prefix)) conditions.turn = "opponent";
+    const encoded = encodeEffectBody(parsedCost.body.replace(/\.$/, "").trim(), { ...context, allowChoice: true });
+    unsupported.push(...encoded.unsupported);
+    if (encoded.effect && encoded.effect.kind !== "none" && encoded.effect.kind !== "unsupported") {
+      abilities.push({
+        id: `${TIMINGS.WHEN_OWN_CHARACTER_MOVES_OUTSIDE_MOVEMENT_PHASE}-${abilities.length + 1}`,
+        timing: TIMINGS.WHEN_OWN_CHARACTER_MOVES_OUTSIDE_MOVEMENT_PHASE,
+        oncePerTurn: parsedCost.oncePerTurn,
+        conditions,
+        cost: structuredClone(parsedCost.cost),
+        effect: encoded.effect
+      });
+    }
+    remainingSelfTriggerText = remainingSelfTriggerText.replace(match[0], " ");
+  }
+
   const selfPattern = /(?<prefix>(?:\[[^\]]+\]\s*)*)when this character moves outside of your movement phase,\s*(?<body>.*?)(?=(?:\s+\[(?:Raid|When Played|When Attacking|When Blocking|When Sidelined|Activate: Main|Start of End Phase)\])|$)/gi;
-  for (const match of text.matchAll(selfPattern)) {
+  for (const match of remainingSelfTriggerText.matchAll(selfPattern)) {
     const prefix = match.groups.prefix ?? "";
     const parsedCost = parseAbilityCost(`${prefix} ${match.groups.body ?? ""}`.trim());
     const conditions = { movedPermanentSelf: true, ...(parsedCost.conditions ?? {}) };
@@ -986,6 +1341,59 @@ function parseCharacterSidelinedTriggeredAbilities(rawText, context = {}) {
     });
   }
 
+  return abilities;
+}
+
+function parseOwnCharacterSidelinedAbilityGrants(rawText, context = {}) {
+  const text = compactEffectText(rawText);
+  const unsupported = context.unsupported ?? [];
+  const abilities = [];
+  if (!text) return abilities;
+
+  const pattern = /(?<tags>(?:\[[^\]]+\]\s*)*)when a \[(?<sidelinedAffinity>[^\]]+)\] affinity card on your field without \[(?<excludedAffinity>[^\]]+)\] affinity is sidelined,\s*all \[(?<targetAffinity>[^\]]+)\] affinity cards on your field gain\s*"\s*\[(?<timing>when played|when attacking|when blocking|when sidelined|activate: main|start of end phase)\]\s*(?<body>[^"]+?)"\s+until (?:the end of the turn|the start of your next turn)\.?/gi;
+  for (const match of text.matchAll(pattern)) {
+    const timing = TIMING_MAP.get(match.groups.timing.toLowerCase());
+    if (!timing) continue;
+    const encoded = encodeEffectBody(match.groups.body.replace(/\.$/, "").trim(), {
+      ...context,
+      allowChoice: false,
+      defaultTarget: "self"
+    });
+    unsupported.push(...encoded.unsupported);
+    if (!encoded.effect || encoded.effect.kind === "none" || encoded.effect.kind === "unsupported") continue;
+
+    const conditions = {
+      sidelinedCharacter: {
+        affinity: match.groups.sidelinedAffinity,
+        withoutAffinity: match.groups.excludedAffinity
+      }
+    };
+    if (/\[#?If on (?:the )?Front Line#?\]/i.test(match.groups.tags)) conditions.line = LINES.FRONT;
+    if (/\[#?If on (?:the )?Energy Line#?\]/i.test(match.groups.tags)) conditions.line = LINES.ENERGY;
+
+    abilities.push({
+      id: `${TIMINGS.WHEN_OWN_CHARACTER_SIDELINED}-${abilities.length + 1}`,
+      timing: TIMINGS.WHEN_OWN_CHARACTER_SIDELINED,
+      oncePerTurn: /\[Once Per Turn\]/i.test(match.groups.tags),
+      conditions,
+      effect: {
+        kind: "grantAbility",
+        target: {
+          controller: "self",
+          line: "field",
+          type: CARD_TYPES.CHARACTER,
+          affinity: match.groups.targetAffinity
+        },
+        duration: /start of your next turn/i.test(match[0]) ? "startOfNextTurn" : "turn",
+        ability: {
+          id: `granted-${timing}`,
+          timing,
+          oncePerTurn: false,
+          effect: encoded.effect
+        }
+      }
+    });
+  }
   return abilities;
 }
 
@@ -1643,10 +2051,37 @@ function parseHandStartAttackPhaseTriggeredAbilities(rawText, context = {}) {
   return abilities;
 }
 
+function parseBpIncreasedTriggeredAbilities(rawText, context = {}) {
+  const text = compactEffectText(rawText);
+  const abilities = [];
+  for (const match of text.matchAll(/(?<turn>\[During Your Turn\]\s*)?(?<once>\[Once Per Turn\]\s*)?When this character's BP is increased,\s*it gains (?<bp>\d+) BP until the end of the turn\./gi)) {
+    abilities.push({
+      id: `${TIMINGS.WHEN_BP_INCREASED}-${context.cardName ?? "card"}-${abilities.length + 1}`,
+      timing: TIMINGS.WHEN_BP_INCREASED,
+      oncePerTurn: Boolean(match.groups.once),
+      conditions: match.groups.turn ? { turn: "controller" } : {},
+      effect: {
+        kind: "modifyBp",
+        amount: Number(match.groups.bp),
+        duration: "turn",
+        target: "self"
+      }
+    });
+  }
+  return abilities;
+}
+
 function parseStaticModifiers(rawText) {
   const text = compactEffectText(rawText);
   const modifiers = [];
+  let insidePrintedAbility = false;
   for (const sentence of text.split(/(?:(?<=\.)|(?<=\.\)))\s+/)) {
+    const startsStaticSection = /^\[(?:During Your Turn|During Opponent's Turn|#?If on (?:the )?(?:Front Line|Energy Line)#?)\]/i.test(sentence);
+    if (startsStaticSection) insidePrintedAbility = false;
+    const printedTiming = [...sentence.matchAll(/\[(?:When Played|When Attacking|When Blocking|When Sidelined|Activate: Main|Start of End Phase)\]/gi)]
+      .some((match) => !isEmbeddedTimingTag(sentence, match.index));
+    if (printedTiming) insidePrintedAbility = true;
+    if (insidePrintedAbility && !startsStaticSection) continue;
     const modifier = parseStaticBpModifierSentence(sentence);
     if (modifier) modifiers.push(modifier);
   }
@@ -1744,10 +2179,54 @@ function parseStaticFieldKeywordModifiers(rawText) {
     if (match.groups.other) target.otherThanName = match.groups.other;
 
     modifiers.push({
-      keyword: "opponentAbilityTargetTax",
-      value: true,
+      keyword: "targetingRestriction",
+      value: targetingRestrictionFromText(match[0]) ?? {
+        mode: "tax",
+        sourceTypes: [CARD_TYPES.CHARACTER, CARD_TYPES.EVENT],
+        payment: { kind: "handToSideline", amount: 1 }
+      },
       target,
       condition
+    });
+  }
+
+  const directPattern = /(?<prefix>(?:\[(?:During Your Turn|During Opponent's Turn|#?If on (?:the )?(?:Front Line|Energy Line)#?)\]\s*)*)(?<subject>\[[^\]]+\] affinity cards|characters|(?:(?:<[^>]+>,\s*)*(?:and\s*)?<[^>]+>) cards) on your field(?: other than <(?<other>[^>]+)>)? (?<restriction>cannot be chosen by [^.]+opponent[^.]*)/gi;
+  for (const match of text.matchAll(directPattern)) {
+    const subject = match.groups.subject.toLowerCase();
+    const target = { controller: "self", line: "field" };
+    const affinity = subject.match(/\[([^\]]+)\] affinity cards/);
+    if (affinity) target.affinity = affinity[1];
+    const names = [...subject.matchAll(/<([^>]+)>/g)].map((nameMatch) => ({ name: nameMatch[1] }));
+    if (names.length === 1) target.name = names[0].name;
+    if (names.length > 1) target.anyOf = names;
+    if (subject === "characters") target.type = CARD_TYPES.CHARACTER;
+    if (match.groups.other) target.otherThanName = match.groups.other;
+    const restriction = targetingRestrictionFromText(`This character ${match.groups.restriction}`);
+    if (!restriction) continue;
+    modifiers.push({
+      keyword: "targetingRestriction",
+      value: restriction,
+      target,
+      condition: conditionFromStaticPrefix(match.groups.prefix ?? "")
+    });
+  }
+
+  const snipeProtectionPattern = /(?<prefix>(?:\[(?:During Your Turn|During Opponent's Turn|#?If on (?:the )?(?:Front Line|Energy Line)#?)\]\s*)*)(?<subject>\[[^\]]+\] affinity cards|characters|(?:(?:<[^>]+>,\s*)*(?:and\s*)?<[^>]+>) cards) on your field(?: other than <(?<other>[^>]+)>)?[^.]*?cannot be targeted by \[Snipe\]/gi;
+  for (const match of text.matchAll(snipeProtectionPattern)) {
+    const subject = match.groups.subject.toLowerCase();
+    const target = { controller: "self", line: "field" };
+    const affinity = subject.match(/\[([^\]]+)\] affinity cards/);
+    if (affinity) target.affinity = affinity[1];
+    const names = [...subject.matchAll(/<([^>]+)>/g)].map((nameMatch) => ({ name: nameMatch[1] }));
+    if (names.length === 1) target.name = names[0].name;
+    if (names.length > 1) target.anyOf = names;
+    if (subject === "characters") target.type = CARD_TYPES.CHARACTER;
+    if (match.groups.other) target.otherThanName = match.groups.other;
+    modifiers.push({
+      keyword: "snipeProtection",
+      value: true,
+      target,
+      condition: conditionFromStaticPrefix(match.groups.prefix ?? "")
     });
   }
 
@@ -1805,6 +2284,16 @@ function parseStaticBpModifierSentence(sentence) {
     if (!condition) return undefined;
     return {
       bp: Number(match[2]),
+      condition: combineConditions([...conditions, condition])
+    };
+  }
+
+  match = lower.match(/^if (.+?),\s*(?:this character|it) loses\s+(\d+)\s+bp\b/);
+  if (match) {
+    const condition = parseStaticBpCondition(`if ${match[1]}`);
+    if (!condition) return undefined;
+    return {
+      bp: -Number(match[2]),
       condition: combineConditions([...conditions, condition])
     };
   }
@@ -1874,7 +2363,19 @@ function parseStaticBpAmountPer(value) {
       filter: { type: CARD_TYPES.CHARACTER }
     };
   }
-  let match = lower.match(/^resting \[([^\]]+)\] affinity card with (\d+) or less base bp on your field$/);
+  let match = lower.match(/^character on your front line with (\d+) or more base ap cost$/);
+  if (match) {
+    return {
+      kind: "fieldCount",
+      controller: "self",
+      line: LINES.FRONT,
+      filter: {
+        type: CARD_TYPES.CHARACTER,
+        apCostMin: Number(match[1])
+      }
+    };
+  }
+  match = lower.match(/^resting \[([^\]]+)\] affinity card with (\d+) or less base bp on your field$/);
   if (match) {
     return {
       kind: "fieldCount",
@@ -1909,6 +2410,40 @@ function parseStaticKeywords(rawText) {
   if (/(?:^|[.]\s+)this (?:character|site|card) cannot be chosen by your opponent's abilities\./.test(text)) {
     keywords.opponentAbilityProtection = true;
   }
+  if (/this character must attack if able\./.test(text)) {
+    keywords.mustAttack = true;
+  }
+  if (/this character must block your opponent's attacks if able\./.test(text)) {
+    keywords.mustBlockAttacks = true;
+  }
+  if (/(?:^|[.]\)?\s+)this character cannot attack or block(?:[.]|$)/.test(text)) {
+    keywords.cantAttack = true;
+    keywords.cantBlock = true;
+  } else {
+    if (/(?:^|[.]\)?\s+)this character cannot attack(?:[.]|$)/.test(text)) keywords.cantAttack = true;
+    if (/(?:^|[.]\)?\s+)this character cannot block(?:[.]|$)/.test(text)) keywords.cantBlock = true;
+  }
+  if (/(?:^|[.]\)?\s+)this character cannot move(?:[.]|$)/.test(text)) keywords.cannotMove = true;
+
+  let match = text.match(/(?:^|[.]\)?\s+)this character cannot be blocked by a character with\s+(\d+)\s+or less bp/);
+  if (match) keywords.cantBeBlockedByBpMax = Number(match[1]);
+  match = text.match(/(?:^|[.]\)?\s+)this character cannot be blocked by a character with\s+(\d+)\s+or more bp/);
+  if (match) keywords.cantBeBlockedByBpMin = Number(match[1]);
+  match = text.match(/(?:^|[.]\)?\s+)this character cannot be blocked by a character with\s+(\d+)\s+or more required energy/);
+  if (match) keywords.cantBeBlockedByRequiredEnergyMin = Number(match[1]);
+  if (/(?:^|[.]\)?\s+)this character cannot be blocked by a raided character/.test(text)) {
+    keywords.cantBeBlockedByRaided = true;
+  }
+  match = text.match(/(?:^|[.]\)?\s+)this character cannot block characters? with\s+(\d+)\s+or less bp/);
+  if (match) keywords.cantBlockAttackerBpMax = Number(match[1]);
+  match = text.match(/(?:^|[.]\)?\s+)this character cannot target characters? with\s+(\d+)\s+or more bp using \[snipe\]/);
+  if (match) keywords.snipeCannotTargetBpMin = Number(match[1]);
+  if (/your opponent cannot activate \[draw trigger\] abilities during trigger checks resulting from damage dealt by this character/.test(text)) {
+    keywords.suppressDrawTriggersOnDamage = true;
+  }
+  if (/your opponent cannot activate \[active trigger\] abilities during trigger checks resulting from damage dealt by this character/.test(text)) {
+    keywords.suppressActiveTriggersOnDamage = true;
+  }
   return keywords;
 }
 
@@ -1926,7 +2461,29 @@ function parseStaticKeywordModifiers(rawText) {
     .flatMap((entry) => parseStaticKeywordModifiersFromTierBody(sanitizeTierStaticBody(entry.body), entry.condition));
   const text = staticTextBeforeAbilities(rawText);
 
-  for (const match of text.matchAll(/(?<condition>if [^.]+?),\s*(?:this character|it) gains\s*(?<body>(?:\[[^\]]+\]\s*(?:and\s*)?)+)/gi)) {
+  for (const match of text.matchAll(/(?<prefix>\[During (?:Your|Opponent's) Turn\]\s*)if (?:one|two|three|four|five|six|seven|\d+) or more copies of <(?<name>[^>]+)> are in your sideline,\s*this character gains \d+ bp\.\s*if (?<count>one|two|three|four|five|six|seven|\d+) or more copies are in your sideline,\s*this character gains (?<body>(?:\[[^\]]+\]\s*(?:and\s*)?)+)/gi)) {
+    const condition = combineConditions([
+      conditionFromStaticPrefix(match.groups.prefix),
+      {
+        zone: "sideline",
+        zoneCountMin: numberFromText(match.groups.count, 0),
+        filter: { name: match.groups.name }
+      }
+    ]);
+    modifiers.push(...parseStaticKeywordModifiersFromTierBody(match.groups.body, condition));
+  }
+
+  for (const match of text.matchAll(/(?:^|[.]\s+|[)]\s+)(?<prefix>(?:\[(?:During Your Turn|During Opponent's Turn|#?If on (?:the )?(?:Front Line|Energy Line)#?)\]\s*)*)(?<condition>if [^.]+?),\s*(?:this character|it) (?:also )?gains\s*(?<body>(?:\[[^\]]+\]\s*(?:and\s*)?)+)/gi)) {
+    const parsedCondition = parseConditionOnly(match.groups.condition.toLowerCase());
+    const condition = parsedCondition && combineConditions([
+      conditionFromStaticPrefix(match.groups.prefix ?? ""),
+      parsedCondition
+    ]);
+    if (!condition || hasUnsupportedStaticKeywordCondition(condition)) continue;
+    modifiers.push(...parseStaticKeywordModifiersFromTierBody(match.groups.body, condition));
+  }
+
+  for (const match of text.matchAll(/(?:^|[.]\s+)(?:this character|it) gains\s*(?<body>\[(?:damage|impact)\s*\(\s*\+?\d+\s*\)\])(?:\s*\([^)]*\))?\s*(?<condition>if [^.]+)\.?/gi)) {
     const condition = parseConditionOnly(match.groups.condition.toLowerCase());
     if (!condition || hasUnsupportedStaticKeywordCondition(condition)) continue;
     modifiers.push(...parseStaticKeywordModifiersFromTierBody(match.groups.body, condition));
@@ -1948,6 +2505,46 @@ function parseStaticKeywordModifiers(rawText) {
     });
   }
 
+  for (const match of text.matchAll(/(?<prefix>\[During (?:Your|Opponent's) Turn\]\s*)?(?<condition>if [^.]+?),\s*this character gains(?: \d+ bp and)?\s*"this character cannot be blocked by (?<restriction>a character with \d+ or (?:more|less) bp|a raided character)\.?"/gi)) {
+    let condition = parseConditionOnly(match.groups.condition.toLowerCase());
+    if (!condition || hasUnsupportedStaticKeywordCondition(condition)) continue;
+    if (match.groups.prefix) {
+      condition = combineConditions([
+        conditionFromStaticPrefix(match.groups.prefix),
+        condition
+      ]);
+    }
+    const restriction = match.groups.restriction.toLowerCase();
+    const bp = restriction.match(/(\d+) or (more|less) bp/);
+    modifiers.push({
+      keyword: restriction === "a raided character"
+        ? "cantBeBlockedByRaided"
+        : bp[2] === "more" ? "cantBeBlockedByBpMin" : "cantBeBlockedByBpMax",
+      value: bp ? Number(bp[1]) : true,
+      condition
+    });
+  }
+
+  for (const match of text.matchAll(/(?<prefix>\[During (?:Your|Opponent's) Turn\]\s*)?(?<condition>if [^.]+?),\s*this character cannot be blocked by (?<restriction>a character with \d+ or (?:more|less) bp|a raided character)\.?/gi)) {
+    let condition = parseConditionOnly(match.groups.condition.toLowerCase());
+    if (!condition || hasUnsupportedStaticKeywordCondition(condition)) continue;
+    if (match.groups.prefix) {
+      condition = combineConditions([
+        conditionFromStaticPrefix(match.groups.prefix),
+        condition
+      ]);
+    }
+    const restriction = match.groups.restriction.toLowerCase();
+    const bp = restriction.match(/(\d+) or (more|less) bp/);
+    modifiers.push({
+      keyword: restriction === "a raided character"
+        ? "cantBeBlockedByRaided"
+        : bp[2] === "more" ? "cantBeBlockedByBpMin" : "cantBeBlockedByBpMax",
+      value: bp ? Number(bp[1]) : true,
+      condition
+    });
+  }
+
   for (const match of text.matchAll(/(?<condition>if [^.]+?),\s*this character gains "this character generates energy even if it is on the front line\.?"/gi)) {
     const condition = parseConditionOnly(match.groups.condition.toLowerCase());
     if (!condition || hasUnsupportedStaticKeywordCondition(condition)) continue;
@@ -1960,8 +2557,12 @@ function parseStaticKeywordModifiers(rawText) {
 
   for (const match of text.matchAll(/(?<prefix>(?:\[(?:During Your Turn|During Opponent's Turn|#?If on (?:the )?(?:Front Line|Energy Line)#?)\]\s*)*)your opponent cannot choose this character with (?:an? )?abilit[^.]+unless they place one card from their hand into their sideline as an additional cost/gi)) {
     modifiers.push({
-      keyword: "opponentAbilityTargetTax",
-      value: true,
+      keyword: "targetingRestriction",
+      value: targetingRestrictionFromText(match[0]) ?? {
+        mode: "tax",
+        sourceTypes: [CARD_TYPES.CHARACTER, CARD_TYPES.EVENT, CARD_TYPES.SITE, "trigger"],
+        payment: { kind: "handToSideline", amount: 1 }
+      },
       condition: conditionFromStaticPrefix(match.groups.prefix ?? "")
     });
   }
@@ -2150,8 +2751,23 @@ function parseStaticKeywordModifiersFromTierBody(body, condition) {
 }
 
 function staticTextBeforeAbilities(rawText) {
-  return compactEffectText(rawText)
-    .split(/\[(?:When Played|When Attacking|When Blocking|When Sidelined|Activate: Main|Start of End Phase)\]|when this character is raided|when this card is placed from your hand into your sideline|when a character on your opponent's front line is sidelined|when this character is returned to your hand from your field|at the start of your turn/i)[0];
+  const text = compactEffectText(rawText);
+  const boundaries = [];
+  for (const match of text.matchAll(/\[(?:When Played|When Attacking|When Blocking|When Sidelined|Activate: Main|Start of End Phase)\]/gi)) {
+    if (!isEmbeddedTimingTag(text, match.index)) boundaries.push(match.index);
+  }
+  for (const pattern of [
+    /when this character is raided/i,
+    /when this card is placed from your hand into your sideline/i,
+    /when a character on your opponent's front line is sidelined/i,
+    /when this character is returned to your hand from your field/i,
+    /at the start of your turn/i
+  ]) {
+    const match = pattern.exec(text);
+    if (match) boundaries.push(match.index);
+  }
+  const boundary = boundaries.length > 0 ? Math.min(...boundaries) : text.length;
+  return text.slice(0, boundary).trim();
 }
 
 function parseStaticEnergyCondition(value) {
@@ -2527,7 +3143,8 @@ function parseTriggerReplacements(rawText) {
             kind: "playSourceFromZone",
             source: "sideline",
             rested: true,
-            destinationLine: LINES.FRONT
+            destinationLines: [LINES.FRONT, LINES.ENERGY],
+            destinationLineChoiceKey: "destinationLine"
           },
           { kind: "moveHandToZone", amount: 1, destination: "sideline" }
         ]
@@ -2549,9 +3166,12 @@ function parseTriggerReplacements(rawText) {
         {
           kind: "playOrRaidCardFromZone",
           zones: ["hand"],
+          min: 0,
+          max: 1,
           count: 1,
           rested: false,
-          destinationLine: LINES.FRONT,
+          destinationLines: [LINES.FRONT, LINES.ENERGY],
+          destinationLineChoiceKey: "destinationLine",
           choiceKey: "replacementZoneIndex",
           allowRaid: true,
           filter: {
@@ -2654,12 +3274,94 @@ function fieldTargetFromMoveOrSwapSubject(subjectText) {
 }
 
 export function encodeEffectBody(rawText, context = {}) {
-  const originalLower = compactEffectText(rawText).toLowerCase();
-  const text = stripEffectTags(compactEffectText(rawText));
+  const encoded = encodeEffectBodyRaw(rawText, context);
+  if (encoded?.effect) markIfDoMoveGates(encoded.effect, rawText);
+  return encoded;
+}
+
+function encodeEffectBodyRaw(rawText, context = {}) {
+  const originalText = compactEffectText(rawText);
+  const originalLower = originalText.toLowerCase();
+  const preservedText = originalText
+    .replace(/^-\s*/, "")
+    .replace(/^if <[^>]+> is on your field,\s*reduce this card's ap cost by \d+ while in your hand\.?\s*/i, "")
+    .replace(/you can only activate this ability[^.]*\./gi, "")
+    .replace(/you can only use this card[^.]*\./gi, "")
+    .trim();
+  const preservedLower = preservedText.toLowerCase();
+  const text = stripEffectTags(originalText);
   if (!text) return { effect: { kind: "none" }, unsupported: [] };
 
+  const mandatoryBlockLink = originalLower.match(/choose one character with (\d+) or less bp on your opponent's front line and one <([^>]+)> on your front line\. the chosen character of your opponent must block the chosen <[^>]+> character's attacks if able this turn/);
+  if (mandatoryBlockLink) {
+    return {
+      effect: {
+        kind: "grantMandatoryBlockLink",
+        blockerTarget: {
+          controller: "opponent",
+          line: LINES.FRONT,
+          type: CARD_TYPES.CHARACTER,
+          bpMax: Number(mandatoryBlockLink[1]),
+          min: 1,
+          max: 1,
+          choiceKey: "mandatoryBlockerTarget"
+        },
+        attackerTarget: {
+          controller: "self",
+          line: LINES.FRONT,
+          type: CARD_TYPES.CHARACTER,
+          name: mandatoryBlockLink[2],
+          min: 1,
+          max: 1,
+          choiceKey: "mandatoryAttackerTarget"
+        },
+        duration: "turn"
+      },
+      unsupported: []
+    };
+  }
+
+  const uniqueSelfSidelinePayoff = originalLower.match(/you may sideline (two|three|four|\d+) characters on your field other than <([^>]+)>\. you cannot sideline characters with the same card name with this ability\. if you sideline (two|three|four|\d+) characters with this ability,\s*(.*)$/);
+  if (uniqueSelfSidelinePayoff) {
+    const count = numberFromText(uniqueSelfSidelinePayoff[1], 2);
+    const threshold = numberFromText(uniqueSelfSidelinePayoff[3], count);
+    const payoff = encodeEffectBody(uniqueSelfSidelinePayoff[4], { ...context, allowChoice: true });
+    return {
+      effect: {
+        kind: "optional",
+        choiceKey: "optionalEffect",
+        default: true,
+        effect: {
+          kind: "sequence",
+          effects: [
+            {
+              kind: "sidelineTargets",
+              target: {
+                controller: "self",
+                line: "field",
+                type: CARD_TYPES.CHARACTER,
+                otherThanName: uniqueSelfSidelinePayoff[2],
+                uniqueNames: true,
+                min: count,
+                max: count,
+                choiceKey: "selfSidelineTargets"
+              }
+            },
+            {
+              kind: "conditional",
+              condition: { lastSidelinedTargetCountMin: threshold },
+              effect: payoff.effect
+            }
+          ]
+        }
+      },
+      unsupported: payoff.unsupported
+    };
+  }
+
   const preChoiceRestriction = encodeReplacementOrUseRestriction(text.toLowerCase());
-  const choice = context.allowChoice === false ? undefined : encodeChoiceEffect(text, context);
+  // Choice branches must retain keyword tags until each branch is encoded.
+  const choice = context.allowChoice === false ? undefined : encodeChoiceEffect(preservedText, context);
   if (choice) {
     return preChoiceRestriction
       ? {
@@ -2686,6 +3388,40 @@ export function encodeEffectBody(rawText, context = {}) {
 
   if (lower === "ability." || lower === "and" || lower === "abilities on its base card." || lower === "this character gains \"") {
     return { effect: { kind: "none" }, unsupported };
+  }
+
+  const readyThenGrantedAbility = /^switch this character to active and give it\s+"/i.test(originalLower)
+    ? encodeGrantedTimingAbility(originalLower, "self")
+    : undefined;
+  if (readyThenGrantedAbility) {
+    return {
+      effect: {
+        kind: "sequence",
+        effects: [
+          { kind: "readySelf" },
+          readyThenGrantedAbility.effect
+        ]
+      },
+      unsupported: readyThenGrantedAbility.unsupported
+    };
+  }
+
+  const drawBpAndGrantedAbility = originalLower.match(/^draw a card and give this character (\d+) bp and\s+"/i)
+    ? encodeGrantedTimingAbility(originalLower, "self")
+    : undefined;
+  if (drawBpAndGrantedAbility) {
+    const bp = Number(originalLower.match(/^draw a card and give this character (\d+) bp/i)?.[1] ?? 0);
+    return {
+      effect: {
+        kind: "sequence",
+        effects: [
+          { kind: "draw", amount: 1 },
+          { kind: "modifyBp", amount: bp, duration: "turn", target: "self" },
+          drawBpAndGrantedAbility.effect
+        ]
+      },
+      unsupported: drawBpAndGrantedAbility.unsupported
+    };
   }
 
   const restrictOpponentEnergyToFront = lower.match(/during the movement phase of your opponent's next turn,\s*they cannot move characters on their energy line to their front line,\s*but they can move characters on their front line to their energy line\.?/);
@@ -2745,6 +3481,7 @@ export function encodeEffectBody(rawText, context = {}) {
     return {
       effect: {
         kind: "revealTopDeckOptionalPlayOrRaidInstead",
+        publicReveal: true,
         filter: {
           color: "green",
           requiredEnergyMin: 3,
@@ -2761,6 +3498,26 @@ export function encodeEffectBody(rawText, context = {}) {
         destinationLine: LINES.FRONT,
         destinations: ["top", "bottom"],
         defaultDestination: "top"
+      },
+      unsupported
+    };
+  }
+
+  const revealUnderThenOpponentHandToYourSideline = lower.match(/^reveal all face-down cards under this (?:site|card) and \{?add them to your hand\}?\. your opponent may place (one|two|three|four|five|\d+) cards? from their hand into their sideline\. if they do, \{?place them into your sideline\}? instead\.?$/);
+  if (revealUnderThenOpponentHandToYourSideline) {
+    return {
+      effect: {
+        kind: "sequence",
+        effects: [
+          { kind: "moveUnderCardsToZone", all: true, faceUp: true, destination: "hand", target: "self" },
+          {
+            kind: "opponentMayMoveCardsBetweenZonesElse",
+            source: "hand",
+            destination: "sideline",
+            destinationPlayer: "self",
+            count: numberFromText(revealUnderThenOpponentHandToYourSideline[1], 1)
+          }
+        ]
       },
       unsupported
     };
@@ -3167,7 +3924,31 @@ export function encodeEffectBody(rawText, context = {}) {
     };
   }
 
-  const optionalHandMove = lower.match(/^you may place (one|two|three|\d+)(?: (red|blue|green|yellow|purple))? cards? from your hand into your (sideline|removal area)\. if you do,?\s*(.*)$/);
+  const optionalAffinityHandMove = preservedLower.match(/^you may place (one|a|two|three|four|five|six|seven|\d+) \[([^\]]+)\] affinity cards? from your hand into your (sideline|removal area)\. if you do,?\s*(.*)$/);
+  if (optionalAffinityHandMove) {
+    const moved = {
+      kind: "moveHandToZone",
+      amount: numberFromText(optionalAffinityHandMove[1], 1),
+      destination: optionalAffinityHandMove[3] === "removal area" ? "removal" : "sideline",
+      filter: { affinity: optionalAffinityHandMove[2] }
+    };
+    const encoded = encodeEffectBody(optionalAffinityHandMove[4].trim(), { ...context, allowChoice: true });
+    const optionalEffect = {
+      kind: "optional",
+      choiceKey: "optionalEffect",
+      default: true,
+      effect: {
+        kind: "sequence",
+        effects: [moved, encoded.effect]
+      }
+    };
+    return {
+      effect: effects.length > 0 ? { kind: "sequence", effects: [...effects, optionalEffect] } : optionalEffect,
+      unsupported: encoded.unsupported
+    };
+  }
+
+  const optionalHandMove = preservedLower.match(/^you may place (one|two|three|\d+)(?: (red|blue|green|yellow|purple))? cards? from your hand into your (sideline|removal area)\. if you do,?\s*(.*)$/);
   if (optionalHandMove) {
     const moved = {
       kind: "moveHandToZone",
@@ -3585,7 +4366,7 @@ export function encodeEffectBody(rawText, context = {}) {
     };
   }
 
-  const restThen = encodeRestThenEffect(lower, context);
+  const restThen = encodeRestThenEffect(preservedLower, context);
   if (restThen) {
     return {
       effect: effects.length > 0 ? { kind: "sequence", effects: [...effects, restThen.effect] } : restThen.effect,
@@ -3593,7 +4374,10 @@ export function encodeEffectBody(rawText, context = {}) {
     };
   }
 
-  const leadingCondition = parseLeadingCondition(lower);
+  // Preserve keyword tags in the conditional body. `lower` has reminder text
+  // stripped, which is useful for action parsing but would otherwise discard
+  // grants such as `... gains \"must block\" and [Impact (1)]`.
+  const leadingCondition = parseLeadingCondition(preservedLower);
   if (leadingCondition) {
     if (!leadingCondition.body) return { effect: { kind: "none" }, unsupported };
     const encoded = encodeEffectBody(leadingCondition.body, { ...context, allowChoice: false });
@@ -3613,7 +4397,12 @@ export function encodeEffectBody(rawText, context = {}) {
       kind: "playSourceFromZone",
       source: "sideline",
       rested: playSourceMatch[1] !== "active",
-      destinationLine: LINES.FRONT
+      ...(playSourceMatch[2] === "field"
+        ? {
+            destinationLines: [LINES.FRONT, LINES.ENERGY],
+            destinationLineChoiceKey: "destinationLine"
+          }
+        : { destinationLine: LINES.FRONT })
     });
   }
 
@@ -3654,7 +4443,13 @@ export function encodeEffectBody(rawText, context = {}) {
         effects: [
           {
             kind: "moveOrSwapTargetsToOtherLine",
-            target: { controller: "self", line: "field", type: CARD_TYPES.CHARACTER }
+            target: {
+              controller: "self",
+              line: "field",
+              type: CARD_TYPES.CHARACTER,
+              min: 0,
+              max: MAX_LINE_SIZE * 2
+            }
           },
           { kind: "draw", amount: 1 }
         ]
@@ -4168,6 +4963,9 @@ export function encodeEffectBody(rawText, context = {}) {
     effects.push(grantedTimingAbility.effect);
     unsupported.push(...grantedTimingAbility.unsupported);
   }
+  if (target && /it gains\s+"this character remains set to resting the next time it would be switched to active\.?"/.test(originalLower)) {
+    effects.push({ kind: "restTargets", preventNextReady: true, target });
+  }
   if (lower.includes("gains \"this character cannot attack\"")
     && lower.includes("\"if this character is active at the end of your attack phase, sideline it\"")) {
     effects.push({
@@ -4592,7 +5390,7 @@ export function encodeEffectBody(rawText, context = {}) {
 
   if (lower.includes("your opponent reveals the top card of their deck")
     && lower.includes("into their sideline")) {
-    effects.push({ kind: "moveTopDeck", player: "opponent", count: 1, destination: "sideline" });
+    effects.push({ kind: "moveTopDeck", player: "opponent", count: 1, destination: "sideline", publicReveal: true });
   }
 
   const underSelfMatch = lower.match(/place(?: the)? top\s+(\w+|\d+)?\s*cards? of your deck face down under this character/);
@@ -4718,6 +5516,7 @@ export function encodeEffectBody(rawText, context = {}) {
       kind: "moveZoneCardsUnderSelf",
       source: "sideline",
       count: 1,
+      min: sidelineUnderSelf[0].includes("up to") ? 0 : 1,
       faceUp: false,
       filter: {
         type: CARD_TYPES.CHARACTER,
@@ -4733,6 +5532,7 @@ export function encodeEffectBody(rawText, context = {}) {
       kind: "moveZoneCardsUnderSelf",
       source: "sideline",
       count: 1,
+      min: sidelineAffinityUnderSelf[0].includes("up to") ? 0 : 1,
       faceUp: false,
       filter: { affinity: sidelineAffinityUnderSelf[1] }
     });
@@ -4744,6 +5544,7 @@ export function encodeEffectBody(rawText, context = {}) {
       kind: "moveZoneCardsUnderTargets",
       source: "sideline",
       count: 1,
+      min: sidelineAffinityUnderTarget[0].includes("up to") ? 0 : 1,
       faceUp: false,
       filter: { affinity: sidelineAffinityUnderTarget[1] },
       target: {
@@ -4761,6 +5562,7 @@ export function encodeEffectBody(rawText, context = {}) {
       kind: "moveZoneCardsUnderTargets",
       source: "sideline",
       count: 1,
+      min: sidelineNamedUnderFaceDownTarget[0].includes("up to") ? 0 : 1,
       faceUp: false,
       filter: { name: sidelineNamedUnderFaceDownTarget[1] },
       target: {
@@ -4779,6 +5581,7 @@ export function encodeEffectBody(rawText, context = {}) {
       kind: "moveZoneCardsUnderTargets",
       source: "sideline",
       count: 1,
+      min: sidelineNamedUnderTarget[0].includes("up to") ? 0 : 1,
       faceUp: true,
       filter: { name: sidelineNamedUnderTarget[1] },
       target: {
@@ -4820,10 +5623,13 @@ export function encodeEffectBody(rawText, context = {}) {
 
   const opponentPlayFromHand = lower.match(/your opponent plays(?: up to)? one character card(?: with \{?(\d+) or less\}? required energy)?(?: and (\d+) ap cost)? from their hand set to\s+\{?(active|resting)\}?.*onto their front line/);
   if (opponentPlayFromHand) {
+    const optionalPlay = lower.includes("your opponent plays up to one");
     effects.push({
       kind: "playCardFromZone",
       player: "opponent",
       zone: "hand",
+      min: optionalPlay ? 0 : 1,
+      max: 1,
       rested: opponentPlayFromHand[3] !== "active",
       destinationLine: LINES.FRONT,
       choiceKey: "opponentPlayHandIndex",
@@ -4837,12 +5643,19 @@ export function encodeEffectBody(rawText, context = {}) {
 
   const sameNamePlay = lower.match(/play(?: up to)? (one|two) (?:(red|blue|green|yellow|purple) )?character card with \{?(\d+) or less\}? required energy,?\s+(\d+) ap cost, and the same card name as the chosen character from your (hand or sideline|hand|sideline).*set to\s+\{?(active|resting)\}?.*onto your\s+(front line|field)/);
   if (sameNamePlay && target) {
+    const ontoField = sameNamePlay[7] === "field";
     effects.push({
       kind: "playCardFromZoneMatchingTargetName",
       zones: zoneListFromText(sameNamePlay[5]),
+      min: lower.includes("play up to") ? 0 : numberFromText(sameNamePlay[1], 1),
       count: numberFromText(sameNamePlay[1], 1),
       rested: sameNamePlay[6] !== "active",
-      destinationLine: LINES.FRONT,
+      ...(ontoField
+        ? {
+            destinationLines: [LINES.FRONT, LINES.ENERGY],
+            destinationLineChoiceKey: "destinationLine"
+          }
+        : { destinationLine: LINES.FRONT }),
       choiceKey: "playZoneIndex",
       target,
       filter: {
@@ -5218,7 +6031,7 @@ export function encodeEffectBody(rawText, context = {}) {
       kind: "grantEnergy",
       color,
       amount: colors.length || 1,
-      duration: lower.includes("until the end of the turn") ? "turn" : "permanent",
+      duration: effectDurationFromText(lower),
       target: "self"
     });
     if (lower.includes("at the end of the main phase, sideline this character")) {
@@ -5244,7 +6057,10 @@ export function encodeEffectBody(rawText, context = {}) {
   const drawMatch = lowerWithoutQuotedText.match(/\bdraw(?: up to)?\s+\{?(a|one|two|three|four|five|\d+)(?: card)?\}?\s+cards?\b/)
     ?? lowerWithoutQuotedText.match(/\bdraw\s+\{?(a|one|two|three|four|five|\d+)\s+cards?\}?/);
   if (drawMatch) {
-    effects.push({ kind: "draw", amount: numberFromText(drawMatch[1], 1) });
+    const drawEffect = { kind: "draw", amount: numberFromText(drawMatch[1], 1) };
+    effects.push(lowerWithoutQuotedText.includes("draw up to")
+      ? { kind: "optional", choiceKey: "optionalDraw", default: true, effect: drawEffect }
+      : drawEffect);
   }
 
   const handToSidelineMatch = lower.match(/place\s+(?:up to\s+)?\{?(one|a|two|three|four|five|six|\d+)\}?\s+cards?\s+from your hand into your sideline/);
@@ -5543,7 +6359,7 @@ export function encodeEffectBody(rawText, context = {}) {
     if (lower.includes("loses abilities") || lower.includes("loses all base abilities")) {
       effects.push({
         kind: "grantKeyword",
-        keyword: "lostAbilities",
+        keyword: "lostBaseAbilities",
         duration: lower.includes("until the start of your next turn") ? "startOfNextTurn" : "turn",
         target
       });
@@ -5636,7 +6452,7 @@ export function encodeEffectBody(rawText, context = {}) {
     effects.push({
       kind: "modifyBp",
       amount: Number(bpMatch[1]),
-      duration: lower.includes("until the end of the turn") ? "turn" : "permanent",
+      duration: effectDurationFromText(lower),
       target: target ?? "self"
     });
   }
@@ -5646,7 +6462,7 @@ export function encodeEffectBody(rawText, context = {}) {
     effects.push({
       kind: "modifyBp",
       amount: -Number(bpLossMatch[1]),
-      duration: lower.includes("until the end of the turn") ? "turn" : "permanent",
+      duration: effectDurationFromText(lower),
       target: target ?? "self"
     });
   }
@@ -5656,7 +6472,7 @@ export function encodeEffectBody(rawText, context = {}) {
     effects.push({
       kind: "modifyBp",
       amount: -Number(reduceSelfBpMatch[1]),
-      duration: lower.includes("until the end of the turn") ? "turn" : "permanent",
+      duration: effectDurationFromText(lower),
       target: "self"
     });
   }
@@ -5673,12 +6489,12 @@ export function encodeEffectBody(rawText, context = {}) {
     });
   }
 
-  const damageMatch = lower.match(/deal\s+(one|two|three|\d+)\s+damage to your opponent/);
+  const damageMatch = lowerWithoutQuotedText.match(/deal\s+(one|two|three|\d+)\s+damage to your opponent/);
   if (damageMatch) {
     effects.push({ kind: "damageOpponent", amount: numberFromText(damageMatch[1], 1) });
   }
 
-  const damageThemMatch = lower.match(/deal\s+(one|two|three|\d+)\s+damage to them/);
+  const damageThemMatch = lowerWithoutQuotedText.match(/deal\s+(one|two|three|\d+)\s+damage to them/);
   if (damageThemMatch) {
     effects.push({ kind: "damageOpponent", amount: numberFromText(damageThemMatch[1], 1) });
   }
@@ -5745,8 +6561,12 @@ export function encodeEffectBody(rawText, context = {}) {
     });
   }
 
-  const keywordGrant = encodeKeywordGrant(originalLower);
-  if (keywordGrant) {
+  const keywordGrants = [
+    encodeKeywordGrant(originalLower),
+    ...encodeSupplementalKeywordGrants(originalLower)
+  ].filter((grant, index, grants) => grant
+    && grants.findIndex((candidate) => candidate?.keyword === grant.keyword) === index);
+  for (const keywordGrant of keywordGrants) {
     effects.push(target && keywordGrant.target === "self" && lower.includes("choose")
       ? { ...keywordGrant, target }
       : keywordGrant);
@@ -5787,6 +6607,30 @@ export function encodeEffectBody(rawText, context = {}) {
   };
 }
 
+function markIfDoMoveGates(effect, rawText) {
+  const lower = compactEffectText(rawText).toLowerCase();
+  if (!lower.includes("if you do")) return;
+  const upToMove = /place up to (?:one|two|three|four|five|six|seven|\d+)[^.]+? from your (?:hand|sideline|removal area|life area)[^.]*\. if you do/.test(lower);
+
+  const visit = (candidate) => {
+    if (!candidate || typeof candidate !== "object") return;
+    if (candidate.kind === "sequence") {
+      const children = candidate.effects ?? [];
+      const moveIndex = children.findIndex((child, index) => index < children.length - 1
+        && ["moveCardBetweenZones", "moveHandToZone"].includes(child?.kind));
+      if (moveIndex !== -1) {
+        const move = children[moveIndex];
+        move.requiredMovedCountForFollowing = upToMove ? 1 : Number(move.count ?? move.amount ?? 1);
+      }
+    }
+    for (const value of Object.values(candidate)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object") visit(value);
+    }
+  };
+  visit(effect);
+}
+
 function encodeChoiceEffect(text, context) {
   if (/change .*"choose one of the following"/i.test(text)) return undefined;
   const match = /choose (?:up to )?one of (?:the )?(?:following|abilities listed below)[:.]?\s*/i.exec(text);
@@ -5804,7 +6648,11 @@ function encodeChoiceEffect(text, context) {
     postChoiceTexts.push(sentence.trim());
     return "";
   });
+  const uniqueChoiceMatch = branchText.match(/^you cannot choose one of the abilities on <([^>]+)> that you have already chosen this turn\.\s*/i);
   branchText = branchText.replace(/^you cannot choose one of the abilities on <[^>]+> that you have already chosen this turn\.\s*/i, "");
+  const choiceTurnRule = uniqueChoiceMatch
+    ? { uniqueChoicesPerTurn: true, choiceUsageKey: uniqueChoiceMatch[1].toLowerCase() }
+    : {};
   const branches = branchText
     .split(/\s+-\s+|\s*-\s*(?=choose\b|if\b|draw\b|place\b|play\b|switch\b|move\b|sideline\b|return\b)|\s*・\s*|\s*\?\s*/i)
     .map((branch) => branch.replace(/^-\s*/, "").trim())
@@ -5861,6 +6709,7 @@ function encodeChoiceEffect(text, context) {
       condition: chooseAllCondition,
       effect: {
         kind: "chooseN",
+        ...choiceTurnRule,
         choiceKey: "effectChoices",
         min: choices.length,
         max: choices.length,
@@ -5872,6 +6721,7 @@ function encodeChoiceEffect(text, context) {
         condition: chooseTwoCondition,
         effect: {
           kind: "chooseN",
+          ...choiceTurnRule,
           choiceKey: "effectChoices",
           min: 1,
           max: 2,
@@ -5880,6 +6730,7 @@ function encodeChoiceEffect(text, context) {
         },
         elseEffect: {
           kind: "chooseOne",
+          ...choiceTurnRule,
           choiceKey: "effectChoice",
           choices
         }
@@ -5892,6 +6743,7 @@ function encodeChoiceEffect(text, context) {
       condition: chooseAllCondition,
       effect: {
         kind: "chooseN",
+        ...choiceTurnRule,
         choiceKey: "effectChoices",
         min: chooseAllMatch[2] ? 1 : choices.length,
         max: choices.length,
@@ -5900,6 +6752,7 @@ function encodeChoiceEffect(text, context) {
       },
       elseEffect: {
         kind: "chooseOne",
+        ...choiceTurnRule,
         choiceKey: "effectChoice",
         choices
       }
@@ -5907,6 +6760,7 @@ function encodeChoiceEffect(text, context) {
   } else if (chooseTwoCostMatch) {
     const chooseOneEffect = {
       kind: "chooseOne",
+      ...choiceTurnRule,
       choiceKey: "effectChoice",
       choices
     };
@@ -5923,6 +6777,7 @@ function encodeChoiceEffect(text, context) {
       baseEffect: chooseOneEffect,
       upgradedEffect: {
         kind: "chooseN",
+        ...choiceTurnRule,
         choiceKey: "effectChoices",
         min: 1,
         max: 2,
@@ -5934,6 +6789,7 @@ function encodeChoiceEffect(text, context) {
   } else if (chooseNMatch) {
     effects.push({
       kind: "chooseN",
+      ...choiceTurnRule,
       choiceKey: "effectChoices",
       min: 1,
       max: 2,
@@ -5943,6 +6799,7 @@ function encodeChoiceEffect(text, context) {
   } else {
     effects.push({
       kind: "chooseOne",
+      ...choiceTurnRule,
       choiceKey: "effectChoice",
       choices
     });
@@ -5980,6 +6837,13 @@ function encodeChoiceEffect(text, context) {
     effect: wrapOptionalIfNeeded(text.toLowerCase(), effect),
     unsupported
   };
+}
+
+function effectDurationFromText(text, fallback = "permanent") {
+  if (text.includes("until the start of your next turn")) return "startOfNextTurn";
+  if (text.includes("until the end of the attack")) return "attack";
+  if (text.includes("until the end of the turn")) return "turn";
+  return fallback;
 }
 
 function encodeRepeatedBpLoss(lower) {
@@ -6034,7 +6898,7 @@ function encodeInsteadChoice(prefix, branches, context) {
     const baseEffect = {
       kind: "modifyBp",
       amount: -Number(baseBpLoss[1]),
-      duration: prefixLower.includes("until the end of the turn") ? "turn" : "permanent",
+      duration: effectDurationFromText(prefixLower),
       target
     };
     const choices = branches.map((branch, index) => {
@@ -6046,7 +6910,7 @@ function encodeInsteadChoice(prefix, branches, context) {
           effect: {
             kind: "modifyBp",
             amount: -Number(instead[1]),
-            duration: prefixLower.includes("until the end of the turn") ? "turn" : "permanent",
+            duration: effectDurationFromText(prefixLower),
             target
           }
         };
@@ -6121,13 +6985,13 @@ function encodeBpInstead(lower, target) {
     effect: {
       kind: "modifyBp",
       amount: -Number(match[3]),
-      duration: lower.includes("until the end of the turn") ? "turn" : "permanent",
+      duration: effectDurationFromText(lower),
       target
     },
     elseEffect: {
       kind: "modifyBp",
       amount: -Number(match[1]),
-      duration: lower.includes("until the end of the turn") ? "turn" : "permanent",
+      duration: effectDurationFromText(lower),
       target
     }
   };
@@ -6270,13 +7134,27 @@ function encodeChoiceModeModifier(lower) {
 function encodeGrantedTimingAbility(originalLower, target) {
   const match = originalLower
     .replace(/\s+/g, " ")
-    .match(/(?:it|that character|those characters|this character) gains?\s+"\s*\[(when played|when attacking|when blocking|when sidelined|activate: main|start of end phase)\]\s*([^"]+?)"\s+until (the end of the turn|the start of your next turn)/i);
+    .match(/(?:(?:it|that character|those characters|this character) gains?(?:\s+\d+\s+bp\s+and)?|give (?:it|that character|those characters|this character)(?:\s+\d+\s+bp\s+and)?)\s+"\s*\[(when played|when attacking|when blocking|when sidelined|activate: main|start of end phase)\]\s*([^"]+?)"\s+until (the end of the turn|the start of your next turn)/i);
   if (!match) return undefined;
 
   const timing = TIMING_MAP.get(match[1].toLowerCase());
   if (!timing) return undefined;
 
-  const encoded = encodeEffectBody(match[2].replace(/\.$/, "").trim(), { allowChoice: false });
+  const body = match[2].replace(/\.$/, "").trim();
+  const conditional = body.match(/^if (.+?),\s*(.+)$/i);
+  let encoded;
+  if (conditional) {
+    const condition = parseConditionOnly(`if ${conditional[1].toLowerCase()}`);
+    const followUp = encodeEffectBody(conditional[2], { allowChoice: false });
+    encoded = condition
+      ? {
+        effect: { kind: "conditional", condition, effect: followUp.effect },
+        unsupported: followUp.unsupported
+      }
+      : followUp;
+  } else {
+    encoded = encodeEffectBody(body, { allowChoice: false });
+  }
   if (!encoded.effect || encoded.effect.kind === "none" || encoded.effect.kind === "unsupported") return undefined;
 
   return {
@@ -6518,7 +7396,114 @@ function parseConditionOnly(lower) {
     return { anyTriggerAbilityActivatedThisTurn: true };
   }
 
-  let match = text.match(/^if you have (one|two|three|four|five|six|seven|\d+) or more \[([^\]]+)\] affinity cards? or (one|two|three|four|five|six|seven|\d+) or more event cards? in your sideline$/);
+  let match = text.match(/^if there are (one|two|three|four|five|six|seven|\d+) or more characters? on your opponent's front line$/);
+  if (match) {
+    return {
+      fieldController: "opponent",
+      frontLineCountMin: numberFromText(match[1], 0),
+      filter: { type: CARD_TYPES.CHARACTER }
+    };
+  }
+
+  if (text === "if there is an active character on your opponent's front line") {
+    return {
+      fieldController: "opponent",
+      frontLineCountMin: 1,
+      filter: { type: CARD_TYPES.CHARACTER, active: true }
+    };
+  }
+
+  match = text.match(/^if you have (one|two|three|four|five|six|seven|\d+) or more cards? without \[trigger\] abilities on your field$/);
+  if (match) {
+    return {
+      fieldCountMin: numberFromText(match[1], 0),
+      filter: { noTrigger: true }
+    };
+  }
+
+  match = text.match(/^if you have (one|two|three|four|five|six|seven|\d+) or more other \[([^\]]+)\] affinity cards? with (\d+) or more bp on your front line$/);
+  if (match) {
+    return {
+      frontLineCountMin: numberFromText(match[1], 0),
+      otherThanSource: true,
+      filter: { affinity: match[2], bpMin: Number(match[3]) }
+    };
+  }
+
+  match = text.match(/^if you have (one|two|three|four|five|six|seven|\d+) or more other \[([^\]]+)\] affinity cards? or (?:a|an|one) <([^>]+)> on your field$/);
+  if (match) {
+    return {
+      anyOf: [
+        {
+          fieldCountMin: numberFromText(match[1], 0),
+          otherThanSource: true,
+          filter: { affinity: match[2] }
+        },
+        { namedOnField: match[3] }
+      ]
+    };
+  }
+
+  match = text.match(/^if there are (one|two|three|four|five|six|seven|eight|nine|ten|\d+) or more cards? in your removal area$/);
+  if (match) {
+    return {
+      zone: "removal",
+      zoneCountMin: numberFromText(match[1], 0)
+    };
+  }
+
+  match = text.match(/^if (?:there are )?(one|two|three|four|five|six|seven|\d+) or more \[([^\]]+)\] affinity cards? with unique names in your removal area$/);
+  if (match) {
+    return {
+      zone: "removal",
+      uniqueZoneNameCountMin: numberFromText(match[1], 0),
+      filter: { affinity: match[2] }
+    };
+  }
+
+  match = text.match(/^if a character with (\d+) or more bp is on your field$/);
+  if (match) return { fieldCountMin: 1, filter: { type: CARD_TYPES.CHARACTER, bpMin: Number(match[1]) } };
+
+  match = text.match(/^if there is a character with (\d+) or more bp on your opponent's field$/);
+  if (match) {
+    return {
+      fieldController: "opponent",
+      fieldCountMin: 1,
+      filter: { type: CARD_TYPES.CHARACTER, bpMin: Number(match[1]) }
+    };
+  }
+
+  match = text.match(/^if you have (?:a|an|one) <([^>]+)> in your sideline$/);
+  if (match) return { zone: "sideline", zoneCountMin: 1, filter: { name: match[1] } };
+
+  match = text.match(/^if (?:a|an|one) <([^>]+)> is in your sideline$/);
+  if (match) return { zone: "sideline", zoneCountMin: 1, filter: { name: match[1] } };
+
+  match = text.match(/^if you have (one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|\d+) or less cards? in your deck$/);
+  if (match) return { deckCountMax: numberFromText(match[1], 0) };
+
+  match = text.match(/^if you have used a <([^>]+)> or <([^>]+)> card this turn$/);
+  if (match) return { usedFromHandThisTurn: { anyOf: [{ name: match[1] }, { name: match[2] }] } };
+
+  match = text.match(/^if you have (one|two|three|four|five|six|seven|\d+) or more cards? with different required energy values in your sideline$/);
+  if (match) return { differentRequiredEnergyValuesInSidelineMin: numberFromText(match[1], 0) };
+
+  match = text.match(/^if you have a combined total of (one|two|three|four|five|six|seven|\d+) or more other \[([^\]]+)\] affinity, <([^>]+)>, or <([^>]+)> cards? on your field$/);
+  if (match) {
+    return {
+      fieldCountMin: numberFromText(match[1], 0),
+      otherThanSource: true,
+      filter: {
+        anyOf: [
+          { affinity: match[2] },
+          { name: match[3] },
+          { name: match[4] }
+        ]
+      }
+    };
+  }
+
+  match = text.match(/^if you have (one|two|three|four|five|six|seven|\d+) or more \[([^\]]+)\] affinity cards? or (one|two|three|four|five|six|seven|\d+) or more event cards? in your sideline$/);
   if (!match) {
     match = text.match(/^if this (?:character|site|card) has (one|two|three|four|five|six|seven|\d+) or more face-down cards? under it$/);
     if (match) return { selfUnderFaceDownCardsMin: numberFromText(match[1], 0) };
@@ -6698,7 +7683,24 @@ function parseConditionOnly(lower) {
     };
   }
 
-  const orParts = text.split(/\s+or\s+/);
+  match = text.match(/^if there are (one|two|three|four|five|six|seven|eight|nine|ten|\d+) or more cards? in your removal area,? or (one|two|three|four|five|six|seven|\d+) or more \[([^\]]+)\] affinity cards? with unique names in your removal area$/);
+  if (match) {
+    return {
+      anyOf: [
+        {
+          zone: "removal",
+          zoneCountMin: numberFromText(match[1], 0)
+        },
+        {
+          zone: "removal",
+          uniqueZoneNameCountMin: numberFromText(match[2], 0),
+          filter: { affinity: match[3] }
+        }
+      ]
+    };
+  }
+
+  const orParts = text.split(/\s+or\s+(?!more\b|less\b)/);
   if (orParts.length > 1) {
     const anyOf = orParts
       .map((part, index) => parseConditionOnly(index === 0 && part.startsWith("if ") ? part : `if ${part}`))
@@ -6708,6 +7710,9 @@ function parseConditionOnly(lower) {
 
   match = text.match(/^if <([^>]+)> is on your field$/);
   if (match) return { namedOnField: match[1] };
+
+  match = text.match(/^if <([^>]+)> is not on your field$/);
+  if (match) return { namedNotOnField: match[1] };
 
   match = text.match(/^if <([^>]+)> is on your front line$/);
   if (match) return { namedOnFrontLine: match[1] };
@@ -6855,7 +7860,7 @@ function parseConditionOnly(lower) {
     };
   }
 
-  match = text.match(/^if (?:a character on your field|one of your characters) has been sidelined this turn$/);
+  match = text.match(/^if (?:a character on your field|one of your characters|another character on your field) has been sidelined this turn$/);
   if (match) return { characterSidelinedThisTurn: "self" };
 
   match = text.match(/^if (?:a character on your opponent's field|one of your opponent's characters|one of their characters) has been sidelined this turn$/);
@@ -6925,6 +7930,10 @@ function parseConditionOnly(lower) {
 
   if (text === "if this character has activated an [activate: main] ability that includes [pay 1 ap] this turn") {
     return { apPaidAbilityUsedThisTurn: true };
+  }
+
+  if (text === "if you have paid an ap cost during the attack phase this turn") {
+    return { apPaidDuringAttackPhase: true };
   }
 
   if (text === "if you have performed an extra draw this turn") {
@@ -7107,6 +8116,7 @@ function encodeSearchTopDeck(lower, context) {
       max: 3,
       destination: "hand",
       remainingDestination: lower.includes("remaining cards into your sideline") ? "sideline" : undefined,
+      ...(revealsSelectedSearchCard(lower) ? { revealSelected: true } : {}),
       filter: {
         anyOf: [
           { type: CARD_TYPES.CHARACTER },
@@ -7154,6 +8164,7 @@ function encodeSearchTopDeck(lower, context) {
           max: maxMatch ? numberFromText(maxMatch[1], 1) : 1,
           destination: "hand",
           remainingDestination: "top",
+          ...(revealsSelectedSearchCard(lower) ? { revealSelected: true } : {}),
           filter
         },
         {
@@ -7176,6 +8187,7 @@ function encodeSearchTopDeck(lower, context) {
     count: numberFromText(lookMatch[1] ?? "one", 1),
     max: maxMatch ? numberFromText(maxMatch[1], 1) : 1,
     destination: "hand",
+    ...(revealsSelectedSearchCard(lower) ? { revealSelected: true } : {}),
     remainingDestinations: topOrSidelineRemainder ? ["top", "sideline"] : undefined,
     defaultRemainingDestination: topOrSidelineRemainder ? "top" : undefined,
     remainingDestination: topOrSidelineRemainder
@@ -7187,6 +8199,11 @@ function encodeSearchTopDeck(lower, context) {
       : undefined,
     filter
   };
+}
+
+function revealsSelectedSearchCard(lower) {
+  return /reveal (?:up to )?(?:one|two|three|four|five|\d+|it|them|that card|those cards)/.test(lower)
+    || /reveal [^.]+ and add (?:it|them|that card|those cards) to your hand/.test(lower);
 }
 
 function encodeLookTopDeckAndMove(lower) {
@@ -7400,7 +8417,8 @@ function encodeRevealTopDeck(lower) {
       kind: "lookTopDeckAndMove",
       count: 1,
       destinations: ["top", "bottom"],
-      defaultDestination: "top"
+      defaultDestination: "top",
+      publicReveal: true
     };
   }
 
@@ -7435,6 +8453,7 @@ function encodeRevealTopDeck(lower) {
     count,
     max: 1,
     destination: "hand",
+    publicReveal: true,
     remainingDestination: lower.includes("remaining cards into your sideline")
       || lower.includes("remaining card into your sideline")
       ? "sideline"
@@ -7523,9 +8542,12 @@ function targetFromText(lower, originalLower = lower) {
   if (lower.includes("character with an ability")) target.hasAbilityTiming = TIMINGS.ACTIVATE_MAIN;
   if (lower.includes("raided card") || lower.includes("raided character")) target.raided = true;
   if (lower.includes("non-raided")) target.notRaided = true;
-  if (originalLower.includes("with [raid]")) target.hasRaid = true;
+  if (originalLower.includes("without [raid]")) target.withoutRaid = true;
+  else if (originalLower.includes("with [raid]")) target.hasRaid = true;
   if (lower.includes("with no face-down cards under it")) target.noFaceDownUnder = true;
   if (lower.includes("with a face-down card under it")) target.hasFaceDownUnder = true;
+  const priorAffinityChoice = lower.match(/chosen by an ability on a \[([^\]]+)\] affinity card this turn cannot be chosen by this ability/);
+  if (priorAffinityChoice) target.notChosenBySourceAffinityThisTurn = priorAffinityChoice[1];
 
   return target.controller || target.attacking ? target : undefined;
 }
@@ -7650,6 +8672,20 @@ function encodeMoveCardFromSidelineToHand(lower) {
           { affinity: affinityOrNamed[1] },
           { name: affinityOrNamed[2] }
         ]
+      }
+    };
+  }
+
+  const namedExactRequiredEnergy = lower.match(/add(?: up to)? one <([^>]+)> card with (\d+) required energy from your sideline to your hand/);
+  if (namedExactRequiredEnergy) {
+    return {
+      kind: "moveCardBetweenZones",
+      source: "sideline",
+      destination: "hand",
+      filter: {
+        name: namedExactRequiredEnergy[1],
+        requiredEnergyMin: Number(namedExactRequiredEnergy[2]),
+        requiredEnergyMax: Number(namedExactRequiredEnergy[2])
       }
     };
   }
@@ -7820,6 +8856,25 @@ function encodeMoveCardFromSidelineToDeckTop(lower) {
 }
 
 function encodePlayCharacterFromZone(lower, choiceKey) {
+  const effect = encodePlayCharacterFromZoneBody(lower, choiceKey);
+  if (effect && /\bonto your field\b/.test(lower)) {
+    delete effect.destinationLine;
+    effect.destinationLines = [LINES.FRONT, LINES.ENERGY];
+    effect.destinationLineChoiceKey = "destinationLine";
+  }
+  if (effect && /\bplay up to\b/.test(lower) && effect.min === undefined) effect.min = 0;
+  if (effect?.kind === "playCardFromZone" && /perform raid with (?:it|them)/.test(lower)) {
+    effect.kind = "playOrRaidCardFromZone";
+    effect.allowRaid = true;
+  }
+  if (effect?.allowRaid && lower.includes("cannot perform raid on this character with this ability")) {
+    effect.raidTargetOtherThanSource = true;
+  }
+  if (effect && Number(effect.count ?? 1) > 1) effect.simultaneous = true;
+  return effect;
+}
+
+function encodePlayCharacterFromZoneBody(lower, choiceKey) {
   const destinationLineFromMatch = (value) => value === "energy line" ? LINES.ENERGY : LINES.FRONT;
 
   const namedPairSeparatePlay = lower.match(/play up to one <([^>]+)> and up to one <([^>]+)> card from your (hand or sideline|hand|sideline).*set to\s+\{?(active|resting)\}?.*onto your\s+(front line|field|energy line)/);
@@ -8396,7 +9451,10 @@ function encodeKeywordGrant(originalLower) {
     return { kind: "grantKeyword", keyword: "mustBlock", duration, target: "self" };
   }
   if (originalLower.includes("opponent must block this character's first attack if able")) {
-    return { kind: "grantKeyword", keyword: "mustBlock", duration, target: "self" };
+    return { kind: "grantKeyword", keyword: "mustBlockFirstAttack", duration, target: "self" };
+  }
+  if (originalLower.includes("this character must block your opponent's attacks if able")) {
+    return { kind: "grantKeyword", keyword: "mustBlockAttacks", duration, target: "self" };
   }
   if (originalLower.includes("when this character attacks and is not blocked, draw")) {
     return { kind: "grantKeyword", keyword: "drawOnUnblockedAttack", value: 1, duration, target: "self" };
@@ -8415,7 +9473,13 @@ function encodeKeywordGrant(originalLower) {
   }
   if (originalLower.includes("cannot be sidelined or affected by bp-reducing abilities")
     || originalLower.includes("cannot be sidelined by abilities on your opponent")) {
-    return { kind: "grantKeyword", keyword: "abilityProtection", duration, target: "self" };
+    return {
+      kind: "grantKeyword",
+      keyword: "abilityProtection",
+      value: abilityProtectionFromText(originalLower),
+      duration,
+      target: "self"
+    };
   }
   if (originalLower.includes("generates energy even if it is on the front line")
     || originalLower.includes("generates energy even on the front line")) {
@@ -8423,6 +9487,10 @@ function encodeKeywordGrant(originalLower) {
   }
   if (originalLower.includes("this character can attack from the energy line")) {
     return { kind: "grantKeyword", keyword: "canAttackFromEnergyLine", duration, target: "self" };
+  }
+  const targetingRestriction = targetingRestrictionFromText(originalLower);
+  if (targetingRestriction) {
+    return { kind: "grantKeyword", keyword: "targetingRestriction", value: targetingRestriction, duration, target: "self" };
   }
   if (originalLower.includes("your opponent cannot choose this character with abilities")) {
     return { kind: "grantKeyword", keyword: "opponentAbilityTargetTax", duration: "turn", target: "self" };
@@ -8478,15 +9546,73 @@ function encodeKeywordGrant(originalLower) {
       target: "self"
     };
   }
-  const damage = originalLower.match(/(?:gains.*)?\[damage\s*\(\+?(\d+)\)\]/);
+  const damage = originalLower.match(/(?:gains?|give(?:s)?)[^.]*\[damage\s*\((\+?)(\d+)\)\]/);
   if (damage) {
-    return { kind: "grantKeyword", keyword: "damage", value: Number(damage[1]), duration, target: "self" };
+    return {
+      kind: "grantKeyword",
+      keyword: damage[1] ? "damagePlus" : "damage",
+      value: Number(damage[2]),
+      duration,
+      target: "self"
+    };
   }
-  const impact = originalLower.match(/(?:gains.*)?\[impact\s*\(\+?(\d+)\)\]/);
+  const impact = originalLower.match(/(?:gains?|give(?:s)?)[^.]*\[impact\s*\((\+?)(\d+)\)\]/);
   if (impact) {
-    return { kind: "grantKeyword", keyword: "impact", value: Number(impact[1]), duration, target: "self" };
+    return {
+      kind: "grantKeyword",
+      keyword: impact[1] ? "impactPlus" : "impact",
+      value: Number(impact[2]),
+      duration,
+      target: "self"
+    };
   }
   return undefined;
+}
+
+function encodeSupplementalKeywordGrants(originalLower) {
+  const duration = originalLower.includes("until the start of your next turn")
+    ? "startOfNextTurn"
+    : originalLower.includes("until the end of the attack")
+      ? "attack"
+      : originalLower.includes("until the end of the turn") ? "turn" : "permanent";
+  const grants = [];
+  const add = (keyword, value = true) => grants.push({
+    kind: "grantKeyword",
+    keyword,
+    value,
+    duration,
+    target: "self"
+  });
+
+  for (const match of originalLower.matchAll(/\[(damage|impact)\s*\((\+?)(\d+)\)\]|\[(snipe|step|double attack|double block|nullify impact)\]/g)) {
+    if (insideDelimitedText(originalLower, match.index, '"', '"')
+      || insideDelimitedText(originalLower, match.index, "(", ")")) continue;
+    const sentencePrefix = originalLower.slice(Math.max(0, originalLower.lastIndexOf(".", match.index) + 1), match.index);
+    if (!/(?:gains?|give(?:s)?)[^.]*$/.test(sentencePrefix)) continue;
+    if (match[1]) {
+      const keyword = match[1] === "damage"
+        ? (match[2] ? "damagePlus" : "damage")
+        : (match[2] ? "impactPlus" : "impact");
+      add(keyword, Number(match[3]));
+    } else {
+      add(keywordNameFromText(match[4]));
+    }
+  }
+
+  if (originalLower.includes("cannot be targeted by [snipe]")) add("snipeProtection");
+  let match = originalLower.match(/cannot be blocked by a character with\s+(\d+)\s+or more bp/);
+  if (match) add("cantBeBlockedByBpMin", Number(match[1]));
+  match = originalLower.match(/cannot be blocked by a character with\s+(\d+)\s+or less bp/);
+  if (match) add("cantBeBlockedByBpMax", Number(match[1]));
+  match = originalLower.match(/cannot be blocked by a character with\s+(\d+)\s+or more required energy/);
+  if (match) add("cantBeBlockedByRequiredEnergyMin", Number(match[1]));
+  if (originalLower.includes("cannot be blocked by a raided character")) add("cantBeBlockedByRaided");
+  match = originalLower.match(/cannot target characters? with\s+(\d+)\s+or more bp using \[snipe\]/);
+  if (match) add("snipeCannotTargetBpMin", Number(match[1]));
+  if (originalLower.includes("if this character's bp is less than its base bp, it cannot block")) {
+    add("cantBlockBelowBaseBp");
+  }
+  return grants;
 }
 
 function opponentFrontCharacter(extra = {}) {
@@ -8500,12 +9626,20 @@ function opponentFrontCharacter(extra = {}) {
 
 function stripEffectTags(value) {
   let text = value;
-  text = text.replace(/\[(When Played|When Attacking|When Blocking|When Sidelined|Activate: Main|Start of End Phase|Switch to Resting|Sideline This Card|Once Per Turn|During Your Turn|Raid|#?If on (?:the )?Front Line#?|#?If on (?:the )?Energy Line#?|#?If in (?:the )?Sideline#?|Pay\s+\w+\s+AP|Place\s+\w+\s+Cards?\s+From Hand Into Sideline)\]/gi, "");
-  text = text.replace(/\[(Damage|Impact)\s*\([^)]+\)\]\([^)]*\)/gi, "");
+  text = replaceOutsideDoubleQuotes(text, /\[(When Played|When Attacking|When Blocking|When Sidelined|Activate: Main|Start of End Phase|Switch to Resting|Sideline This Card|Once Per Turn|During Your Turn|Raid|#?If on (?:the )?Front Line#?|#?If on (?:the )?Energy Line#?|#?If in (?:the )?Sideline#?|Pay\s+\w+\s+AP|Place\s+\w+\s+Cards?\s+From Hand Into Sideline)\]/gi);
+  text = replaceOutsideDoubleQuotes(text, /\[(Damage|Impact)\s*\([^)]+\)\]\s*\([^)]*\)/gi);
   for (const tag of KEYWORD_TAGS) {
-    text = text.replace(new RegExp(`\\[${tag}\\]\\([^)]*\\)`, "gi"), "");
+    text = replaceOutsideDoubleQuotes(text, new RegExp(`\\[${tag}\\]\\s*\\([^)]*\\)`, "gi"));
   }
   return text.replace(/\s+/g, " ").trim();
+}
+
+function replaceOutsideDoubleQuotes(text, pattern) {
+  return text.replace(pattern, (match, ...args) => {
+    const offset = args.at(-2);
+    const quoteCount = (text.slice(0, offset).match(/"/g) ?? []).length;
+    return quoteCount % 2 === 1 ? match : "";
+  });
 }
 
 function wrapOptionalIfNeeded(lower, effect) {

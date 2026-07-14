@@ -1,16 +1,23 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   analyzeSetupHand,
   applyAction,
   catalogGameResult,
+  copyLimitForCardNumber,
   createSimulationGame,
   expandDeckList,
   loadCatalogJson,
   loadDeckJson,
+  localCardNumber,
   makeRng,
+  DEFAULT_POLICY_DIR,
+  normalizePilotPolicy,
   normalizeDeckList,
+  resolveArchetypeProfile,
+  resolvePolicyForDeck,
+  resolvePilotSetup,
   runAutoplayGame,
   sourceCodeFromNumber,
   validateDeck
@@ -20,6 +27,7 @@ const DEFAULT_CATALOG = "work/private/egman-unionarena-catalog.json";
 const DEFAULT_LIBRARY = "work/private/decks";
 const DEFAULT_OUT_DIR = "work/private/deck-agent";
 const DEFAULT_ADVISOR_MEMORY = "work/private/deck-agent/advisor-memory.json";
+const CURRENT_POLICY_PATH = "work/private/pilot-agent/current-best-policy.json";
 const LIMITED_TRIGGERS = new Set(["special", "color", "final"]);
 
 const command = process.argv[2];
@@ -59,7 +67,10 @@ function evaluateCommand() {
   });
   const deckId = requiredOption("--deck");
   const deck = loadSavedDeck(config.libraryDir, deckId);
-  const opponents = loadOpponents(config.libraryDir, opponentsText(deckId));
+  const opponentSelection = selectOpponents(config.libraryDir, deckId, config.seed);
+  const opponents = opponentSelection.opponents;
+  config.opponentSelection = opponentSelection.summary;
+  printOpponentSelection(opponentSelection.summary);
   const evaluation = evaluateDeck({
     catalog: config.catalog,
     deck: deck.cards,
@@ -68,10 +79,14 @@ function evaluateCommand() {
     seed: config.seed,
     validateDecks: config.validateDecks,
     autoMulliganBricks: config.autoMulliganBricks,
+    mulliganMode: config.mulliganMode,
     maxTurns: config.maxTurns,
     maxActions: config.maxActions,
     pilotPolicy: config.pilotPolicy,
-    opponentPilotPolicy: config.opponentPilotPolicy
+    opponentPilotPolicy: config.opponentPilotPolicy,
+    policyDir: config.policyDir,
+    fallbackPolicyPath: config.fallbackPolicyPath,
+    libraryDir: config.libraryDir
   });
 
   const report = {
@@ -100,7 +115,10 @@ function optimizeCommand() {
   });
   const baseId = requiredOption("--base");
   const baseDeck = loadSavedDeck(config.libraryDir, baseId);
-  const opponents = loadOpponents(config.libraryDir, opponentsText(baseId));
+  const opponentSelection = selectOpponents(config.libraryDir, baseId, config.seed);
+  const opponents = opponentSelection.opponents;
+  config.opponentSelection = opponentSelection.summary;
+  printOpponentSelection(opponentSelection.summary);
   const populationSize = Number(option("--population") ?? 8);
   const generations = Number(option("--generations") ?? 3);
   const eliteCount = Math.max(1, Number(option("--elite") ?? 2));
@@ -134,11 +152,15 @@ function optimizeCommand() {
         seed: config.seed + generation * 100000 + index * 1000,
         validateDecks: config.validateDecks,
         autoMulliganBricks: config.autoMulliganBricks,
+        mulliganMode: config.mulliganMode,
         maxTurns: config.maxTurns,
         maxActions: config.maxActions,
         pilotPolicy: config.pilotPolicy,
-        opponentPilotPolicy: config.opponentPilotPolicy
-      });
+      opponentPilotPolicy: config.opponentPilotPolicy,
+      policyDir: config.policyDir,
+      fallbackPolicyPath: config.fallbackPolicyPath,
+      libraryDir: config.libraryDir
+    });
       const row = {
         generation,
         candidateId,
@@ -153,7 +175,7 @@ function optimizeCommand() {
       return row;
     }).sort((a, b) => b.score - a.score);
 
-    console.log(`Generation ${generation}: best score ${evaluated[0].score.toFixed(2)} (${formatPercent(evaluated[0].winRate)} win rate)`);
+    console.log(`Generation ${generation}: best score ${evaluated[0].score.toFixed(2)} (${formatPercent(evaluated[0].winRate)} win rate, ${evaluated[0].avgTurnCycles.toFixed(2)} avg turn cycles)`);
 
     if (generation === generations) break;
 
@@ -175,18 +197,41 @@ function optimizeCommand() {
     }
   }
 
+  const finalEvaluationSeed = config.seed + 9000000;
+  const baseFinalEvaluation = evaluateDeck({
+    catalog: config.catalog,
+    deck: baseDeck.cards,
+    opponents,
+    games: config.games,
+    seed: finalEvaluationSeed,
+    validateDecks: config.validateDecks,
+    autoMulliganBricks: config.autoMulliganBricks,
+    mulliganMode: config.mulliganMode,
+    maxTurns: config.maxTurns,
+    maxActions: config.maxActions,
+    pilotPolicy: config.pilotPolicy,
+    opponentPilotPolicy: config.opponentPilotPolicy,
+    policyDir: config.policyDir,
+    fallbackPolicyPath: config.fallbackPolicyPath,
+    libraryDir: config.libraryDir
+  });
+
   const bestEvaluation = evaluateDeck({
     catalog: config.catalog,
     deck: best.deck,
     opponents,
     games: config.games,
-    seed: config.seed + 9000000,
+    seed: finalEvaluationSeed,
     validateDecks: config.validateDecks,
     autoMulliganBricks: config.autoMulliganBricks,
+    mulliganMode: config.mulliganMode,
     maxTurns: config.maxTurns,
     maxActions: config.maxActions,
     pilotPolicy: config.pilotPolicy,
-    opponentPilotPolicy: config.opponentPilotPolicy
+    opponentPilotPolicy: config.opponentPilotPolicy,
+    policyDir: config.policyDir,
+    fallbackPolicyPath: config.fallbackPolicyPath,
+    libraryDir: config.libraryDir
   });
 
   const report = {
@@ -205,13 +250,22 @@ function optimizeCommand() {
       mutationPoolSize: pool.length
     },
     baseDeck: deckSummary(baseId, baseDeck.cards, config.catalog),
+    baseFinalEvaluation: baseFinalEvaluation.summary,
     best: {
       ...withoutDeck(best),
       searchScore: best.score,
       finalEvaluation: bestEvaluation.summary,
       summary: deckSummary("agent-best", best.deck, config.catalog)
     },
+    deckComparison: deckComparisonSummary({
+      baseDeck: baseDeck.cards,
+      candidateDeck: best.deck,
+      baseSummary: baseFinalEvaluation.summary,
+      candidateSummary: bestEvaluation.summary,
+      catalog: config.catalog
+    }),
     rankings,
+    baseGames: baseFinalEvaluation.rows,
     bestGames: bestEvaluation.rows
   };
 
@@ -246,9 +300,20 @@ function solveCommand() {
     validateDecks: config.validateDecks,
     advisorMemory: config.advisorMemory
   });
-  const opponents = option("--opponents") || option("--opponents-file")
-    ? loadOpponents(config.libraryDir, opponentsText())
-    : [{ id: "generated-baseline", name: "Generated Baseline", cards: baseline }];
+  let opponents;
+  if (hasOpponentSelectionOptions()) {
+    const opponentSelection = selectOpponents(config.libraryDir, null, config.seed, { allowMirror: false });
+    opponents = opponentSelection.opponents;
+    config.opponentSelection = opponentSelection.summary;
+    printOpponentSelection(opponentSelection.summary);
+  } else {
+    opponents = [{ id: "generated-baseline", name: "Generated Baseline", cards: baseline }];
+    config.opponentSelection = {
+      mode: "generated-baseline",
+      selectedCount: 1,
+      selectedIds: ["generated-baseline"]
+    };
+  }
 
   let population = [];
   const seen = new Set();
@@ -280,11 +345,15 @@ function solveCommand() {
         seed: config.seed + generation * 100000 + index * 1000,
         validateDecks: config.validateDecks,
         autoMulliganBricks: config.autoMulliganBricks,
+        mulliganMode: config.mulliganMode,
         maxTurns: config.maxTurns,
         maxActions: config.maxActions,
         pilotPolicy: config.pilotPolicy,
-        opponentPilotPolicy: config.opponentPilotPolicy
-      });
+      opponentPilotPolicy: config.opponentPilotPolicy,
+      policyDir: config.policyDir,
+      fallbackPolicyPath: config.fallbackPolicyPath,
+      libraryDir: config.libraryDir
+    });
       const row = {
         generation,
         candidateId,
@@ -297,7 +366,7 @@ function solveCommand() {
       return row;
     }).sort((a, b) => b.score - a.score);
 
-    console.log(`Generation ${generation}: best score ${evaluated[0].score.toFixed(2)} (${formatPercent(evaluated[0].winRate)} win rate)`);
+    console.log(`Generation ${generation}: best score ${evaluated[0].score.toFixed(2)} (${formatPercent(evaluated[0].winRate)} win rate, ${evaluated[0].avgTurnCycles.toFixed(2)} avg turn cycles)`);
 
     if (generation === generations) break;
 
@@ -326,10 +395,14 @@ function solveCommand() {
     seed: config.seed + 9000000,
     validateDecks: config.validateDecks,
     autoMulliganBricks: config.autoMulliganBricks,
+    mulliganMode: config.mulliganMode,
     maxTurns: config.maxTurns,
     maxActions: config.maxActions,
     pilotPolicy: config.pilotPolicy,
-    opponentPilotPolicy: config.opponentPilotPolicy
+    opponentPilotPolicy: config.opponentPilotPolicy,
+    policyDir: config.policyDir,
+    fallbackPolicyPath: config.fallbackPolicyPath,
+    libraryDir: config.libraryDir
   });
 
   const report = {
@@ -388,8 +461,8 @@ function readConfig({ outDir }) {
   }
   const catalogPath = option("--catalog") ?? DEFAULT_CATALOG;
   const libraryDir = option("--library") ?? DEFAULT_LIBRARY;
-  const pilotPolicyPath = option("--pilot-policy");
-  const opponentPilotPolicyPath = option("--opponent-pilot-policy");
+  const pilotPolicyPath = resolvePolicyPath(option("--pilot-policy"));
+  const opponentPilotPolicyPath = resolvePolicyPath(option("--opponent-pilot-policy"));
   return {
     catalogPath,
     libraryDir,
@@ -399,10 +472,13 @@ function readConfig({ outDir }) {
     seed: Number(option("--seed") ?? 1000),
     validateDecks: true,
     autoMulliganBricks: hasFlag("--auto-mulligan-bricks"),
+    mulliganMode: mulliganMode(),
     maxTurns: Number(option("--max-turns") ?? 80),
     maxActions: Number(option("--max-actions") ?? 1000),
     pilotPolicyPath,
     opponentPilotPolicyPath,
+    policyDir: option("--policy-dir") ?? DEFAULT_POLICY_DIR,
+    fallbackPolicyPath: resolvePolicyPath(option("--fallback-policy") ?? "current"),
     pilotPolicy: loadOptionalJson(pilotPolicyPath),
     opponentPilotPolicy: loadOptionalJson(opponentPilotPolicyPath),
     advisorMemoryPath: option("--advisor-memory") ?? DEFAULT_ADVISOR_MEMORY,
@@ -418,15 +494,37 @@ function evaluateDeck({
   seed,
   validateDecks,
   autoMulliganBricks,
+  mulliganMode = autoMulliganBricks ? "bricks" : "auto",
   maxTurns,
   maxActions,
   pilotPolicy,
-  opponentPilotPolicy
+  opponentPilotPolicy,
+  policyDir = DEFAULT_POLICY_DIR,
+  fallbackPolicyPath = CURRENT_POLICY_PATH,
+  libraryDir = DEFAULT_LIBRARY
 }) {
   const rows = [];
   let index = 0;
+  const pilotPolicySelection = policyForDeck({
+    deck,
+    catalog,
+    explicitPolicy: pilotPolicy,
+    policyDir,
+    fallbackPolicyPath,
+    deckLibrary: libraryDir
+  });
 
   for (const opponent of opponents) {
+    const opponentPolicySelection = policyForDeck({
+      deck: opponent.cards,
+      catalog,
+      savedDeck: opponent.raw,
+      deckId: opponent.id,
+      explicitPolicy: opponentPilotPolicy,
+      policyDir,
+      fallbackPolicyPath,
+      deckLibrary: libraryDir
+    });
     for (let game = 0; game < games; game += 1) {
       const firstPlayer = game % 2 === 0 ? "P1" : "P2";
       const gameSeed = seed + index;
@@ -436,15 +534,20 @@ function evaluateDeck({
         seed: gameSeed,
         firstPlayer,
         validateDecks,
-        setupMode: autoMulliganBricks ? "manual" : "auto"
+        setupMode: mulliganMode === "auto" ? "auto" : "manual"
       });
-      const setupState = autoMulliganBricks ? resolveBrickMulligans(simulation.state) : simulation.state;
+      const setupState = resolveSetupForEvaluation(simulation.state, {
+        mulliganMode,
+        pilotPolicy: pilotPolicySelection.policy,
+        opponentPilotPolicy: opponentPolicySelection.policy
+      });
       const playout = runAutoplayGame(setupState, {
         maxTurns,
         maxActions,
-        policy: pilotPolicy || opponentPilotPolicy
-          ? { P1: pilotPolicy, P2: opponentPilotPolicy ?? pilotPolicy }
-          : undefined
+        policy: {
+          P1: pilotPolicySelection.policy,
+          P2: opponentPolicySelection.policy
+        }
       });
       const result = catalogGameResult(playout.state, {
         index: index + 1,
@@ -454,8 +557,15 @@ function evaluateDeck({
         ...result,
         opponent: opponent.id,
         candidatePlayer: "P1",
+        pilotPolicyPath: pilotPolicySelection.path,
+        opponentPolicyPath: opponentPolicySelection.path,
         playoutSteps: playout.steps,
-        playoutStoppedReason: playout.stoppedReason
+        playoutStoppedReason: playout.stoppedReason,
+        playoutFailureCode: playout.failureDiagnostics?.candidateFailures?.[0]?.code ?? "",
+        playoutFailureMessage: playout.failureDiagnostics?.candidateFailures?.[0]?.message ?? "",
+        playoutFailureDiagnostics: playout.failureDiagnostics
+          ? JSON.stringify(playout.failureDiagnostics)
+          : ""
       });
       index += 1;
     }
@@ -465,6 +575,24 @@ function evaluateDeck({
     rows,
     summary: summarizeRows(rows)
   };
+}
+
+function mulliganMode() {
+  if (hasFlag("--pilot-mulligan") || hasFlag("--agent-mulligan")) return "pilot";
+  if (hasFlag("--auto-mulligan-bricks")) return "bricks";
+  return "auto";
+}
+
+function resolveSetupForEvaluation(state, { mulliganMode, pilotPolicy, opponentPilotPolicy }) {
+  if (mulliganMode === "pilot") {
+    const baseline = normalizePilotPolicy(pilotPolicy ?? opponentPilotPolicy);
+    return resolvePilotSetup(state, {
+      P1: normalizePilotPolicy(pilotPolicy ?? baseline),
+      P2: normalizePilotPolicy(opponentPilotPolicy ?? baseline)
+    });
+  }
+  if (mulliganMode === "bricks") return resolveBrickMulligans(state);
+  return state;
 }
 
 function resolveBrickMulligans(state) {
@@ -487,6 +615,7 @@ function summarizeRows(rows) {
   const mulliganRate = average(rows, (row) => row.p1Mulliganed ? 1 : 0);
   const avgLifeDiff = average(rows, (row) => row.p1LifeRemaining - row.p2LifeRemaining);
   const avgTurns = average(rows, (row) => row.turnsTaken);
+  const avgTurnCycles = average(rows, (row) => row.turnCyclesTaken ?? Math.ceil((row.turnsTaken ?? 0) / 2));
   const avgSpecialsInLife = average(rows, (row) => row.p1SpecialTriggersInLife);
   const incompleteRate = total === 0 ? 0 : incomplete / total;
   const score = nonLossRate * 1000 + avgLifeDiff * 8 - brickRate * 100 - incompleteRate * 60;
@@ -502,9 +631,57 @@ function summarizeRows(rows) {
     mulliganRate,
     avgLifeDiff,
     avgTurns,
+    avgTurnCycles,
     avgSpecialsInLife,
     score
   };
+}
+
+function deckComparisonSummary({ baseDeck, candidateDeck, baseSummary, candidateSummary, catalog }) {
+  const changes = deckChangeSummary(baseDeck, candidateDeck, catalog);
+  const winRateDelta = Number(candidateSummary?.winRate ?? 0) - Number(baseSummary?.winRate ?? 0);
+  const scoreDelta = Number(candidateSummary?.score ?? 0) - Number(baseSummary?.score ?? 0);
+  const lifeDiffDelta = Number(candidateSummary?.avgLifeDiff ?? 0) - Number(baseSummary?.avgLifeDiff ?? 0);
+  const brickRateDelta = Number(candidateSummary?.brickRate ?? 0) - Number(baseSummary?.brickRate ?? 0);
+  return {
+    base: baseSummary,
+    candidate: candidateSummary,
+    winRateDelta,
+    scoreDelta,
+    lifeDiffDelta,
+    brickRateDelta,
+    changedCopies: changes.reduce((total, row) => total + Math.abs(Number(row.delta ?? 0)), 0),
+    changes
+  };
+}
+
+function deckChangeSummary(baseDeck, candidateDeck, catalog) {
+  const base = countsFromDeck(baseDeck);
+  const candidate = countsFromDeck(candidateDeck);
+  const ids = [...new Set([...base.keys(), ...candidate.keys()])].sort((a, b) => {
+    const aCard = catalog[a];
+    const bCard = catalog[b];
+    return String(aCard?.number ?? a).localeCompare(String(bCard?.number ?? b));
+  });
+  return ids
+    .map((id) => {
+      const before = Number(base.get(id) ?? 0);
+      const after = Number(candidate.get(id) ?? 0);
+      const delta = after - before;
+      const card = catalog[id];
+      return {
+        id,
+        before,
+        after,
+        delta,
+        number: card?.number ?? id,
+        name: card?.name ?? id,
+        type: card?.type ?? "unknown",
+        trigger: card?.trigger?.type ?? "none",
+        requiredEnergy: Number.isFinite(Number(card?.requiredEnergy?.amount)) ? Number(card.requiredEnergy.amount) : null
+      };
+    })
+    .filter((row) => row.delta !== 0);
 }
 
 function seedPopulation({ baseDeck, catalog, pool, rng, populationSize, mutationSwaps, validateDecks, advisorMemory }) {
@@ -577,10 +754,10 @@ function isDeckCandidateValid(deck, catalog, validateDecks) {
 function copyLimitOk(deck, catalog) {
   const counts = new Map();
   for (const id of expandDeckList(deck)) {
-    const number = catalog[id]?.number ?? id;
+    const number = localCardNumber(catalog[id]?.number ?? id);
     counts.set(number, (counts.get(number) ?? 0) + 1);
   }
-  return [...counts.values()].every((count) => count <= 4);
+  return [...counts.entries()].every(([number, count]) => count <= copyLimitForCardNumber(number));
 }
 
 function mutationPool(catalog, sourceCode) {
@@ -620,8 +797,9 @@ function resolveSolvePool(catalog, request) {
   const sourceTitle = mostCommon(sourceCards.map((card) => card.title ?? card.product ?? sourceCode));
   const pool = sourceCards.sort((a, b) => String(a.number ?? a.id).localeCompare(String(b.number ?? b.id)));
 
-  if (pool.length * 4 < 50) {
-    throw new Error(`Only ${pool.length} matching card(s) are available for ${solveRequestLabel(request)}; at four copies each this cannot make a legal 50-card deck.`);
+  const availableCopies = maxCopiesAvailable(pool);
+  if (availableCopies < 50) {
+    throw new Error(`Only ${availableCopies} matching legal copy slot(s) are available for ${solveRequestLabel(request)}; this cannot make a legal 50-card deck.`);
   }
 
   return {
@@ -672,12 +850,12 @@ function chooseWeightedCard(cards, catalog, rng, advisorMemory) {
 }
 
 function canAddCard(counts, card, catalog, validateDecks) {
-  const number = card.number ?? card.id;
+  const number = localCardNumber(card.number ?? card.id);
   let copiesOfNumber = 0;
   for (const [id, count] of counts.entries()) {
-    if ((catalog[id]?.number ?? id) === number) copiesOfNumber += count;
+    if (localCardNumber(catalog[id]?.number ?? id) === number) copiesOfNumber += count;
   }
-  if (copiesOfNumber >= 4) return false;
+  if (copiesOfNumber >= copyLimitForCardNumber(number)) return false;
 
   if (validateDecks && LIMITED_TRIGGERS.has(card.trigger?.type)) {
     let triggerCopies = 0;
@@ -720,8 +898,8 @@ function advisorCardDelta(card, catalog, advisorMemory) {
 }
 
 function maxCopiesAvailable(cards) {
-  const numbers = new Set(cards.map((card) => card.number ?? card.id));
-  return numbers.size * 4;
+  const numbers = new Set(cards.map((card) => localCardNumber(card.number ?? card.id)));
+  return [...numbers].reduce((total, number) => total + copyLimitForCardNumber(number), 0);
 }
 
 function deckSizeFromCounts(counts) {
@@ -843,6 +1021,50 @@ function loadOptionalJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
+function policyForDeck({
+  deck,
+  catalog,
+  savedDeck = null,
+  deckId = null,
+  explicitPolicy,
+  policyDir,
+  fallbackPolicyPath,
+  deckLibrary
+}) {
+  if (explicitPolicy) {
+    return {
+      policy: normalizePilotPolicy(explicitPolicy),
+      path: "explicit",
+      foundSpecialist: true
+    };
+  }
+  const routed = resolvePolicyForDeck({
+    deck,
+    catalog,
+    savedDeck,
+    deckId,
+    policyDir,
+    fallbackPolicyPath,
+    deckLibrary
+  });
+  return {
+    policy: routed.policy,
+    path: routed.path,
+    foundSpecialist: routed.foundSpecialist,
+    profile: routed.profile
+  };
+}
+
+function resolvePolicyPath(value) {
+  if (!value) return undefined;
+  if (["auto", "routed", "route", "deck", "deck policy", "specialist"].includes(normalizeSearch(value))) return undefined;
+  const normalized = normalizeSearch(value);
+  if (["current", "current best", "current policy", "champion", "best"].includes(normalized)) {
+    return CURRENT_POLICY_PATH;
+  }
+  return value;
+}
+
 function normalizeAdviceEntry(advice, catalog, sourcePath) {
   return {
     importedAt: new Date().toISOString(),
@@ -913,18 +1135,309 @@ function addCardWeight(weights, cardId, delta) {
   weights[cardId] = Math.max(-10, Math.min(10, Number(weights[cardId] ?? 0) + delta));
 }
 
-function loadOpponents(libraryDir, text) {
-  return text.split(/[,\r\n]+/)
-    .map((id) => id.trim())
-    .filter((id) => id && !id.startsWith("#"))
-    .filter(Boolean)
-    .map((id) => loadSavedDeck(libraryDir, id));
+function selectOpponents(libraryDir, fallbackDeckId, seed, { allowMirror = true } = {}) {
+  const mode = opponentMode();
+  if (mode === "explicit") {
+    const text = opponentsText();
+    if (!text) throw new Error("Explicit opponent mode needs --opponents deck-a,deck-b or --opponents-file path.");
+    const ids = opponentIdsFromText(text);
+    return selectedOpponents({
+      libraryDir,
+      mode,
+      ids,
+      seed,
+      summaryExtra: {
+        source: option("--opponents-file") ? option("--opponents-file") : "--opponents"
+      }
+    });
+  }
+
+  if (hasExplicitOpponentList()) {
+    throw new Error(`--opponents and --opponents-file can only be used with explicit opponent mode, not ${mode}.`);
+  }
+
+  if (mode === "mirror") {
+    if (!allowMirror || !fallbackDeckId) {
+      throw new Error("Mirror opponent mode needs a saved deck to mirror. Use explicit, random, regional, or all-regionals instead.");
+    }
+    return selectedOpponents({
+      libraryDir,
+      mode,
+      ids: [fallbackDeckId],
+      seed,
+      summaryExtra: { source: "selected deck" }
+    });
+  }
+
+  const regionalCandidates = readSavedDeckIndex(libraryDir)
+    .filter((deck) => deck.isRegional)
+    .filter((deck) => hasFlag("--opponent-include-self") || deck.id !== fallbackDeckId);
+  let candidates = regionalCandidates;
+  const requestedRegions = optionList("--regions", "--regionals", "--opponent-regions");
+
+  if (mode === "regional") {
+    if (requestedRegions.length === 0) {
+      const locations = uniqueSorted(regionalCandidates.map((deck) => deck.location).filter(Boolean));
+      throw new Error(`Regional opponent mode needs --regions "Peoria Illinois,Virginia". Available regions: ${locations.join(", ")}`);
+    }
+    candidates = candidates.filter((deck) => matchesRequestedRegion(deck.location, requestedRegions));
+  } else if (requestedRegions.length > 0) {
+    candidates = candidates.filter((deck) => matchesRequestedRegion(deck.location, requestedRegions));
+  }
+
+  candidates = applyOpponentFilters(candidates);
+
+  const opponentSeed = Number(option("--opponent-seed") ?? seed + 9176);
+  const requestedCount = Number(option("--opponent-count") ?? (mode === "random" ? 8 : 0));
+  const ids = chooseOpponentIds(candidates, {
+    mode,
+    count: requestedCount,
+    seed: opponentSeed
+  });
+
+  return selectedOpponents({
+    libraryDir,
+    mode,
+    ids,
+    seed: opponentSeed,
+    summaryExtra: {
+      availableRegionalDecks: regionalCandidates.length,
+      candidateDecks: candidates.length,
+      requestedCount: requestedCount || null,
+      regions: requestedRegions,
+      filters: opponentFilterSummary()
+    }
+  });
 }
 
-function opponentsText(fallback) {
+function selectedOpponents({ libraryDir, mode, ids, seed, summaryExtra = {} }) {
+  if (ids.length === 0) throw new Error(`Opponent mode ${mode} did not select any decks.`);
+  const opponents = ids.map((id) => loadSavedDeck(libraryDir, id));
+  return {
+    opponents,
+    summary: {
+      mode,
+      seed,
+      selectedCount: opponents.length,
+      selectedIds: opponents.map((opponent) => opponent.id),
+      ...summaryExtra
+    }
+  };
+}
+
+function opponentMode() {
+  const explicit = option("--opponent-mode") ?? option("--opponents-mode");
+  if (explicit) return normalizeOpponentMode(explicit);
+
+  const opponentsValue = option("--opponents");
+  if (opponentsValue && isOpponentModeKeyword(opponentsValue)) return normalizeOpponentMode(opponentsValue);
+  if (hasExplicitOpponentList()) return "explicit";
+  return "mirror";
+}
+
+function normalizeOpponentMode(value) {
+  const normalized = normalizeSearch(value).replace(/\s+/g, "-");
+  const aliases = new Map([
+    ["list", "explicit"],
+    ["ids", "explicit"],
+    ["manual", "explicit"],
+    ["self", "mirror"],
+    ["self-play", "mirror"],
+    ["all", "all-regionals"],
+    ["all-regional", "all-regionals"],
+    ["all-regionals", "all-regionals"],
+    ["regional-all", "all-regionals"],
+    ["regionals", "all-regionals"]
+  ]);
+  const mode = aliases.get(normalized) ?? normalized;
+  const allowed = new Set(["explicit", "mirror", "random", "regional", "all-regionals"]);
+  if (!allowed.has(mode)) {
+    throw new Error(`Unknown opponent mode: ${value}. Use explicit, mirror, random, regional, or all-regionals.`);
+  }
+  return mode;
+}
+
+function isOpponentModeKeyword(value) {
+  try {
+    normalizeOpponentMode(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasOpponentSelectionOptions() {
+  return Boolean(option("--opponent-mode") || option("--opponents-mode") || option("--opponents") || option("--opponents-file"));
+}
+
+function hasExplicitOpponentList() {
+  const opponentsValue = option("--opponents");
+  return Boolean(option("--opponents-file") || opponentsValue && !isOpponentModeKeyword(opponentsValue));
+}
+
+function opponentIdsFromText(text) {
+  return text.split(/[,\r\n]+/)
+    .map((id) => id.trim())
+    .filter((id) => id && !id.startsWith("#"));
+}
+
+function chooseOpponentIds(candidates, { mode, count, seed }) {
+  if (candidates.length === 0) throw new Error(`Opponent mode ${mode} has no candidate decks after filters.`);
+  const sorted = [...candidates].sort(compareOpponentDecks);
+  if (mode !== "random" && (!count || count >= sorted.length)) return sorted.map((deck) => deck.id);
+
+  const rng = makeRng(seed);
+  const shuffled = [...sorted];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(rng() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  const limit = count > 0 ? Math.min(count, shuffled.length) : shuffled.length;
+  return shuffled.slice(0, limit).map((deck) => deck.id);
+}
+
+function applyOpponentFilters(decks) {
+  let candidates = decks;
+  const top = Number(option("--opponent-top") ?? 0);
+  if (top > 0) {
+    candidates = candidates.filter((deck) => deck.placement !== null && deck.placement <= top);
+  }
+
+  const colors = optionList("--opponent-color", "--opponent-colors").map(normalizeSearch);
+  if (colors.length > 0) {
+    candidates = candidates.filter((deck) => deck.colors.some((color) => colors.includes(normalizeSearch(color))));
+  }
+
+  const sets = optionList("--opponent-set", "--opponent-sets").map(normalizeSearch);
+  if (sets.length > 0) {
+    candidates = candidates.filter((deck) => sets.some((set) => deck.searchText.includes(set)));
+  }
+
+  return candidates;
+}
+
+function opponentFilterSummary() {
+  return {
+    top: Number(option("--opponent-top") ?? 0) || null,
+    colors: optionList("--opponent-color", "--opponent-colors"),
+    sets: optionList("--opponent-set", "--opponent-sets")
+  };
+}
+
+function matchesRequestedRegion(location, requestedRegions) {
+  const locationText = normalizeSearch(location);
+  return requestedRegions.some((region) => {
+    const terms = normalizeSearch(region).split(/\s+/).filter(Boolean);
+    return terms.length > 0 && terms.every((term) => locationText.includes(term));
+  });
+}
+
+function compareOpponentDecks(a, b) {
+  return (a.location ?? "").localeCompare(b.location ?? "")
+    || Number(a.placement ?? 9999) - Number(b.placement ?? 9999)
+    || a.name.localeCompare(b.name)
+    || a.id.localeCompare(b.id);
+}
+
+function printOpponentSelection(selection) {
+  const label = selection.regions?.length > 0 ? ` (${selection.regions.join(", ")})` : "";
+  console.log(`Selected ${selection.selectedCount} opponent deck(s) with ${selection.mode} mode${label}.`);
+}
+
+function optionList(...flags) {
+  return flags.flatMap((flag) => {
+    const value = option(flag);
+    if (!value) return [];
+    return value.split(/[,\r\n]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  });
+}
+
+function uniqueSorted(values) {
+  return [...new Set(values)].sort((a, b) => a.localeCompare(b));
+}
+
+function readSavedDeckIndex(libraryDir) {
+  if (!existsSync(libraryDir)) return [];
+  return readdirSync(libraryDir)
+    .filter((file) => file.toLowerCase().endsWith(".json"))
+    .map((file) => {
+      try {
+        const raw = JSON.parse(readFileSync(join(libraryDir, file), "utf8"));
+        if (!raw.id || !Array.isArray(raw.cards)) return null;
+        return deckIndexEntry(raw, join(libraryDir, file));
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+}
+
+function deckIndexEntry(raw, path) {
+  const source = raw.source ?? {};
+  const summary = raw.summary ?? {};
+  const validation = raw.validation ?? {};
+  const archetypeResolution = resolveArchetypeProfile({
+    deck: raw.cards,
+    savedDeck: raw,
+    deckId: raw.id,
+    deckLibrary: dirname(path)
+  });
+  const profile = archetypeResolution.profile;
+  const colors = [
+    ...new Set([
+      ...(profile.colors ?? []),
+      ...(Array.isArray(summary.colors) ? summary.colors : []),
+      summary.color
+    ].filter(Boolean))
+  ];
+  const placement = Number(source.placement);
+  const searchText = normalizeSearch([
+    raw.id,
+    raw.name,
+    source.player,
+    source.location,
+    source.event,
+    source.deckType,
+    profile.key,
+    profile.setColorKey,
+    validation.sourceCode,
+    summary.sourceCode,
+    ...(Array.isArray(summary.sourceCodes) ? summary.sourceCodes : []),
+    ...colors
+  ].filter(Boolean).join(" "));
+
+  return {
+    id: raw.id,
+    name: raw.name ?? raw.id,
+    path,
+    isRegional: raw.id.startsWith("regional-") || Boolean(source.location || source.manifestPath),
+    location: source.location ?? null,
+    event: source.event ?? null,
+    eventDate: source.eventDate ?? null,
+    player: source.player ?? null,
+    placement: Number.isFinite(placement) ? placement : null,
+    deckType: source.deckType ?? null,
+    colors,
+    sourceCode: profile.sourceCode ?? validation.sourceCode ?? summary.sourceCode ?? null,
+    ownKey: profile.key,
+    setColorKey: profile.setColorKey,
+    archetypeResolution: profile.archetypeResolution,
+    searchText
+  };
+}
+
+function normalizeSearch(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function opponentsText() {
   const file = option("--opponents-file");
   if (file) return readFileSync(file, "utf8");
-  return option("--opponents") ?? fallback;
+  const opponentsValue = option("--opponents");
+  return opponentsValue && !isOpponentModeKeyword(opponentsValue) ? opponentsValue : undefined;
 }
 
 function loadSavedDeck(libraryDir, id) {
@@ -935,6 +1448,9 @@ function loadSavedDeck(libraryDir, id) {
     id: raw.id ?? id,
     name: raw.name ?? id,
     path,
+    raw,
+    summary: raw.summary ?? null,
+    validation: raw.validation ?? null,
     cards: loadDeckJson(path)
   };
 }
@@ -1037,6 +1553,7 @@ function buildTestingAnalysis({ report, rankings, gameRows, bestDeckSummary }) {
   const recommendations = [];
   const confidenceNotes = [];
   const completedRate = summary.total === 0 ? 0 : (summary.total - summary.incomplete) / summary.total;
+  const comparison = report.deckComparison ?? null;
   const weakMatchups = matchups.filter((matchup) => matchup.winRate < 0.5);
   const strongMatchups = matchups
     .filter((matchup) => matchup.winRate >= 0.65 && matchup.total >= 3)
@@ -1057,6 +1574,8 @@ function buildTestingAnalysis({ report, rankings, gameRows, bestDeckSummary }) {
   if (completedRate >= 0.9) positives.push(`Most games completed under the autoplay limits (${formatPercent(completedRate)} completion rate).`);
   if (bestDeckSummary.zeroCostUnits >= 10 && bestDeckSummary.zeroCostUnits <= 18) positives.push(`Zero-cost unit count looks healthy at ${bestDeckSummary.zeroCostUnits}.`);
   if (strongMatchups.length > 0) positives.push(`Best matchup result was into ${strongMatchups[0].opponent} at ${formatPercent(strongMatchups[0].winRate)}.`);
+  if (comparison && comparison.winRateDelta > 0) positives.push(`Candidate beat the saved base deck by ${formatPercentDelta(comparison.winRateDelta)} in the paired final check.`);
+  if (comparison && comparison.scoreDelta > 0) positives.push(`Candidate score improved by ${comparison.scoreDelta.toFixed(2)} over the saved base deck.`);
 
   if (summary.winRate < 0.5) negatives.push(`Win rate was below break-even at ${formatPercent(summary.winRate)}.`);
   if (summary.avgLifeDiff < 0) negatives.push(`Average life differential was negative at ${summary.avgLifeDiff.toFixed(2)}.`);
@@ -1067,8 +1586,12 @@ function buildTestingAnalysis({ report, rankings, gameRows, bestDeckSummary }) {
   if (bestDeckSummary.uniqueCards > 24) negatives.push(`The candidate is spread across ${bestDeckSummary.uniqueCards} unique cards, so consistency may be low.`);
   if (bestDeckSummary.zeroCostUnits < 8) negatives.push(`Zero-cost unit count is low at ${bestDeckSummary.zeroCostUnits}, increasing brick risk.`);
   if (largestCurveBucket && largestCurveBucket.count >= 35) negatives.push(`The energy curve is heavily concentrated at ${largestCurveBucket.label} required energy (${largestCurveBucket.count} cards); verify that is intentional and that catalog costs are encoded correctly.`);
+  if (comparison && comparison.winRateDelta < 0) negatives.push(`Candidate lost ${formatPercentDelta(Math.abs(comparison.winRateDelta))} win rate versus the saved base deck in the paired final check.`);
+  if (comparison && comparison.scoreDelta < 0) negatives.push(`Candidate score fell by ${Math.abs(comparison.scoreDelta).toFixed(2)} versus the saved base deck.`);
 
   if (weakMatchups.length > 0) recommendations.push(`Run focused tests into ${weakMatchups[0].opponent} and compare card choices from winning candidates.`);
+  if (comparison && comparison.winRateDelta > 0) recommendations.push("Rerun this candidate against the same opponent pool with more games before manually updating the saved deck.");
+  if (comparison && comparison.winRateDelta <= 0) recommendations.push("Do not adopt this candidate yet; either rerun with more games or try a smaller mutation set.");
   if (bestDeckSummary.uniqueCards > 24) recommendations.push("Try a follow-up optimize run from `best-deck.txt` with fewer mutation swaps to consolidate the card package.");
   if (summary.brickRate >= 0.1 || summary.mulliganRate >= 0.2) recommendations.push("Bias the next candidate pool toward more reliable 0-cost units and early energy pieces.");
   if (summary.incomplete > 0) recommendations.push("Increase `--max-turns` or inspect incomplete games in `games.csv` to see where autoplay stalls.");
@@ -1089,13 +1612,15 @@ function buildTestingAnalysis({ report, rankings, gameRows, bestDeckSummary }) {
       nonLossRate: summary.nonLossRate,
       avgLifeDiff: summary.avgLifeDiff,
       avgTurns: summary.avgTurns,
+      avgTurnCycles: summary.avgTurnCycles,
       brickRate: summary.brickRate,
       mulliganRate: summary.mulliganRate,
       avgSpecialsInLife: summary.avgSpecialsInLife,
       firstSecond,
       stopReasons,
       matchups,
-      topRankings
+      topRankings,
+      baseComparison: comparison
     },
     deckShape: {
       size: bestDeckSummary.size,
@@ -1158,10 +1683,14 @@ function analysisMarkdown(analysis) {
     `- Wins / losses / incomplete: ${breakdown.wins} / ${breakdown.losses} / ${breakdown.incomplete}`,
     `- Win rate: ${formatPercent(breakdown.winRate)}`,
     `- Average life differential: ${breakdown.avgLifeDiff.toFixed(2)}`,
+    `- Average turn cycles: ${breakdown.avgTurnCycles.toFixed(2)}`,
     `- Brick rate: ${formatPercent(breakdown.brickRate)}`,
     `- Mulligan rate: ${formatPercent(breakdown.mulliganRate)}`,
     `- Went first / second: ${breakdown.firstSecond.wentFirst} / ${breakdown.firstSecond.wentSecond}`,
     `- Stop reasons: ${JSON.stringify(breakdown.stopReasons)}`,
+    breakdown.baseComparison
+      ? `- Paired base comparison: ${formatPercent(breakdown.baseComparison.base?.winRate ?? 0)} base vs ${formatPercent(breakdown.baseComparison.candidate?.winRate ?? 0)} candidate (${formatPercentDelta(breakdown.baseComparison.winRateDelta)} delta), score delta ${Number(breakdown.baseComparison.scoreDelta ?? 0).toFixed(2)}`
+      : `- Paired base comparison: unavailable`,
     "",
     "## Positives",
     "",
@@ -1189,6 +1718,12 @@ function analysisMarkdown(analysis) {
     `- Energy curve: ${JSON.stringify(analysis.deckShape.energyCurve)}`,
     `- Trigger counts: ${JSON.stringify(analysis.deckShape.triggerCounts)}`,
     "",
+    "## Candidate Changes",
+    "",
+    ...(breakdown.baseComparison?.changes?.length
+      ? breakdown.baseComparison.changes.map((change) => `- ${change.delta > 0 ? "+" : ""}${change.delta} ${change.name} (${change.number})`)
+      : ["- No card-count changes recorded."]),
+    "",
     "## Confidence Notes",
     "",
     ...analysis.confidenceNotes.map((item) => `- ${item}`)
@@ -1197,6 +1732,13 @@ function analysisMarkdown(analysis) {
 }
 
 function advisorPromptMarkdown(report, analysis, bestDeck, catalog) {
+  const comparison = analysis.testingBreakdown.baseComparison ?? null;
+  const comparisonLine = comparison
+    ? `${formatPercent(comparison.base?.winRate ?? 0)} saved base vs ${formatPercent(comparison.candidate?.winRate ?? 0)} candidate (${formatPercentDelta(comparison.winRateDelta)}), score delta ${Number(comparison.scoreDelta ?? 0).toFixed(2)}`
+    : "unavailable";
+  const candidateChanges = comparison?.changes?.length
+    ? comparison.changes.map((change) => `- ${change.delta > 0 ? "+" : ""}${change.delta} ${change.name} (${change.number})`).join("\n")
+    : "- No card-count changes recorded.";
   return `# Union Arena GPT Advisor Request
 
 You are advising a local Union Arena deck-building agent. Review this run and give concise, actionable deck-building feedback.
@@ -1230,6 +1772,7 @@ Use exact card codes when possible. Do not suggest illegal deck construction.
 - Brick rate: ${formatPercent(analysis.testingBreakdown.brickRate)}
 - Mulligan rate: ${formatPercent(analysis.testingBreakdown.mulliganRate)}
 - Opponents: ${analysis.testingBreakdown.matchups.map((matchup) => matchup.opponent).join(", ") || "none"}
+- Paired base comparison: ${comparisonLine}
 
 ## Local Agent Analysis
 
@@ -1241,6 +1784,10 @@ ${analysis.negatives.map((item) => `- ${item}`).join("\n")}
 
 ### Recommendations
 ${analysis.recommendations.map((item) => `- ${item}`).join("\n")}
+
+## Candidate Changes
+
+${candidateChanges}
 
 ## Best Deck Candidate
 
@@ -1339,6 +1886,11 @@ function formatPercent(value) {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+function formatPercentDelta(value) {
+  const number = Number(value ?? 0);
+  return `${number > 0 ? "+" : ""}${(number * 100).toFixed(1)} percentage points`;
+}
+
 function option(flag) {
   const index = process.argv.indexOf(flag);
   return index === -1 ? undefined : process.argv[index + 1];
@@ -1363,15 +1915,35 @@ function timestamp() {
 
 function usage() {
   console.log(`Usage:
-  node tools/deck-agent.mjs evaluate --deck deck-id --opponents opp-a,opp-b [--games 20] [--auto-mulligan-bricks]
-  node tools/deck-agent.mjs optimize --base deck-id --opponents opp-a,opp-b [--generations 3] [--population 8] [--games 12] [--auto-mulligan-bricks]
-  node tools/deck-agent.mjs solve --query "Blue Slime" --opponents opp-a,opp-b [--generations 3] [--population 8] [--games 12] [--auto-mulligan-bricks]
+  node tools/deck-agent.mjs evaluate --deck deck-id --opponent-mode random --opponent-count 8 [--games 20] [--auto-mulligan-bricks]
+  node tools/deck-agent.mjs optimize --base deck-id --opponent-mode regional --regions "Peoria Illinois,Virginia" [--generations 3] [--population 8] [--games 12]
+  node tools/deck-agent.mjs solve --query "Blue Slime" --opponent-mode all-regionals --opponent-top 16 [--generations 3] [--population 8] [--games 12]
+  node tools/deck-agent.mjs evaluate --deck deck-id --opponents opp-a,opp-b
   node tools/deck-agent.mjs solve --query "Blue Slime" --opponents-file work/private/deck-gauntlets/regional-last3.txt
   node tools/deck-agent.mjs import-advice --advice-file path/to/union-arena-gpt-advice.json
 
+Opponent modes:
+  --opponent-mode explicit      Use --opponents deck-a,deck-b or --opponents-file path. This is also the default when those are supplied.
+  --opponent-mode mirror        Self-play against the selected/base deck. This is the evaluate/optimize default with no opponent options.
+  --opponent-mode random        Sample regional decks. Use --opponent-count N, default 8.
+  --opponent-mode regional      Use regionals named by --regions "Peoria Illinois,Orlando Florida".
+  --opponent-mode all-regionals Use every saved regional deck, with optional filters.
+
+Opponent filters:
+  --opponent-count 8
+  --regions "Peoria Illinois,Virginia"
+  --opponent-top 16
+  --opponent-color purple
+  --opponent-set SLG
+  --opponent-seed 1234
+  --opponent-include-self
+
 Pilot options:
-  --pilot-policy work/private/pilot-agent/run/best-policy.json
-  --opponent-pilot-policy work/private/pilot-agent/opponent/best-policy.json
+  --pilot-policy current
+  --opponent-pilot-policy current
+  --pilot-mulligan
+
+When pilot policies are omitted, each deck routes to work/private/pilot-agent/baselines/decks/<set-color>/baseline-policy.json and falls back to work/private/pilot-agent/current-best-policy.json. Legacy policies under work/private/pilot-agent/policies are still read as fallbacks.
 
 Outputs are written under work/private/deck-agent by default:
   report.json
@@ -1382,5 +1954,5 @@ Outputs are written under work/private/deck-agent by default:
   best-deck.json
   best-deck.txt
 
-The agent treats --opponents as the local meta gauntlet. Add more saved meta decks there to make the search care about them. Deck-agent candidates are always validated as legal decks. Advisor advice is stored in work/private/deck-agent/advisor-memory.json by default.`);
+The agent treats selected opponents as the local meta gauntlet. Add more saved meta decks or use regional opponent modes to make the search care about them. Deck-agent candidates are always validated as legal decks. Advisor advice is stored in work/private/deck-agent/advisor-memory.json by default.`);
 }

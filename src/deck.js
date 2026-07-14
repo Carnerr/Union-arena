@@ -8,8 +8,16 @@ const LIMITED_TRIGGER_TYPES = new Set([
 ]);
 
 const COPY_LIMIT_OVERRIDES = new Map([
-  ["SLG-1-030", 12]
+  ["HTR-1-026", 3],
+  ["HTR-1-029", 3],
+  ["SLG-1-030", 12],
+  ["JJK-3-072", 3],
+  ["HTR-2-011", 14]
 ]);
+
+export function copyLimitForCardNumber(cardNumber) {
+  return COPY_LIMIT_OVERRIDES.get(localCardNumber(cardNumber)) ?? 4;
+}
 
 export function sourceCodeFromNumber(cardNumber) {
   return localCardNumber(cardNumber).split("-").at(0).toUpperCase();
@@ -59,6 +67,7 @@ export function validateDeck(deckList, catalog) {
   const sourceCodes = new Set();
   const cardNumberCounts = new Map();
   const limitedTriggerCounts = new Map();
+  const cardNumberLimits = new Map();
 
   for (const cardId of expanded) {
     const def = catalog[cardId];
@@ -68,6 +77,7 @@ export function validateDeck(deckList, catalog) {
     sourceCodes.add(sourceCode);
     const cardNumber = localCardNumber(def.number);
     cardNumberCounts.set(cardNumber, (cardNumberCounts.get(cardNumber) ?? 0) + 1);
+    cardNumberLimits.set(cardNumber, def.deckCopyLimit ?? copyLimitForCardNumber(cardNumber));
 
     const triggerType = def.trigger?.type ?? TRIGGER_TYPES.NONE;
     if (LIMITED_TRIGGER_TYPES.has(triggerType)) {
@@ -80,7 +90,7 @@ export function validateDeck(deckList, catalog) {
   });
 
   for (const [number, count] of cardNumberCounts) {
-    const limit = COPY_LIMIT_OVERRIDES.get(number) ?? 4;
+    const limit = cardNumberLimits.get(number) ?? copyLimitForCardNumber(number);
     assertRule(count <= limit, "COPY_LIMIT", `No more than ${limit} cards with the same card number may be included.`, {
       number,
       count,

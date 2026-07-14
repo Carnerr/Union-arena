@@ -81,7 +81,7 @@ Useful options:
 
 - `--seed 1000`: use deterministic sequential seeds: `1000`, `1001`, `1002`, ...
 - `--random-seed`: use fresh random seeds for each game.
-- `--auto-mulligan-bricks`: keep non-bricked hands and mulligan initial hands with no 0-cost unit.
+- `--auto-mulligan-bricks`: keep non-bricked hands and mulligan initial hands with no setup-valid opener.
 - `--playout`: run each game forward with the built-in deterministic basic pilot so winner and end-life fields can fill in.
 - `--max-turns 100`: stop an autoplay game after this many total player turns.
 - `--save-states`: save every generated game state, not just the summary files.
@@ -96,6 +96,6 @@ game-catalog.json
 game-catalog.csv
 ```
 
-`game-catalog` is the analysis-friendly ledger for each generated game. Each row includes the winner, first/second player, remaining life totals, mulligan flags, brick flags, zero-cost unit counts, special triggers in starting life, and turn counts. Brick is defined here as a final setup hand with no character whose `requiredEnergy.amount` is `0`; `initialBricked` is also recorded so mulliganed hands can be analyzed separately.
+`game-catalog` is the analysis-friendly ledger for each generated game. Each row includes the winner, first/second player, remaining life totals, mulligan flags, brick flags, setup opener counts, special triggers in starting life, and turn counts. Brick is defined here as a final setup hand with no setup-valid opener: either a literal 0-cost character or an empty-field required-energy reducer that becomes playable as the first unit. Legacy `ZeroCostUnitsSeen` columns are still written for compatibility; use the newer `SetupOpenersSeen` columns when reading current output.
 
 Without `--playout`, rows describe shuffled opening game states and `complete` will usually be `false`. With `--playout`, rows describe the final state reached by the basic pilot; `playoutStoppedReason` says whether the game ended by `winner`, `maxTurns`, `maxActions`, or no available autoplay action.

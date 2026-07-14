@@ -16,10 +16,16 @@ import {
 import { validateCatalog } from "./catalog.js";
 import { expandDeckList, validateDeck } from "./deck.js";
 import { assertRule } from "./errors.js";
-import { shuffled } from "./random.js";
+import { deriveSeed, shuffled } from "./random.js";
+
+const resolutionChoiceResolvers = new WeakMap();
 
 function cloneState(state) {
-  return structuredClone(state);
+  const { catalog, ...mutableState } = state;
+  return {
+    ...structuredClone(mutableState),
+    catalog
+  };
 }
 
 function getPlayer(state, playerId) {
@@ -29,6 +35,16 @@ function getPlayer(state, playerId) {
 
 function getOpponent(state, playerId) {
   return getPlayer(state, opponentOf(playerId));
+}
+
+function resolveRuntimeChoices(state, playerId, effect, context, request) {
+  const resolver = resolutionChoiceResolvers.get(state);
+  if (!resolver) return;
+  const resolved = resolver({ state, playerId, effect, context, request });
+  if (resolved === undefined || resolved === null) return;
+  assertRule(resolved && typeof resolved === "object" && !Array.isArray(resolved), "EFFECT_CHOICE", "A resolution choice resolver must return a choices object.");
+  context.choices ??= {};
+  Object.assign(context.choices, resolved);
 }
 
 function defOf(state, cardOrId) {
@@ -51,11 +67,17 @@ function topDef(state, permanent) {
   return defOf(state, topCard(permanent));
 }
 
+function baseAbilitiesLost(permanent) {
+  return (permanent.keywordModifiers ?? [])
+    .some((modifier) => modifier.keyword === "lostBaseAbilities");
+}
+
 function abilitiesOfPermanent(state, permanent) {
   const top = topDef(state, permanent);
   const baseCard = permanent.cards.at(-2);
   const baseAbilityTimings = top.gainsBaseAbilityTimings ?? [];
-  const baseAbilities = baseCard && baseAbilityTimings.length > 0
+  const printedAbilities = baseAbilitiesLost(permanent) ? [] : (top.abilities ?? []);
+  const baseAbilities = !baseAbilitiesLost(permanent) && baseCard && baseAbilityTimings.length > 0
     ? (defOf(state, baseCard).abilities ?? [])
       .filter((ability) => baseAbilityTimings.includes(ability.timing))
       .map((ability) => ({
@@ -64,7 +86,7 @@ function abilitiesOfPermanent(state, permanent) {
       }))
     : [];
   return [
-    ...(top.abilities ?? []),
+    ...printedAbilities,
     ...baseAbilities,
     ...(permanent.gainedAbilities ?? [])
   ];
@@ -75,8 +97,9 @@ function isCharacter(state, permanent) {
 }
 
 function hasKeyword(state, permanent, keyword) {
-  const base = topDef(state, permanent).keywords?.[keyword];
-  const staticKeyword = (topDef(state, permanent).staticKeywordModifiers ?? [])
+  const printedAbilitiesActive = !baseAbilitiesLost(permanent);
+  const base = printedAbilitiesActive ? topDef(state, permanent).keywords?.[keyword] : undefined;
+  const staticKeyword = printedAbilitiesActive && (topDef(state, permanent).staticKeywordModifiers ?? [])
     .some((modifier) => modifier.keyword === keyword && staticModifierApplies(state, permanent, modifier));
   const staticFieldKeyword = staticFieldKeywordModifiersForPermanent(state, permanent)
     .some(({ modifier }) => modifier.keyword === keyword);
@@ -85,9 +108,10 @@ function hasKeyword(state, permanent, keyword) {
 }
 
 function keywordValue(state, permanent, keyword, fallback = 0) {
-  const value = topDef(state, permanent).keywords?.[keyword];
+  const printedAbilitiesActive = !baseAbilitiesLost(permanent);
+  const value = printedAbilitiesActive ? topDef(state, permanent).keywords?.[keyword] : undefined;
   const base = value === true ? 1 : Number(value ?? fallback);
-  const staticValues = (topDef(state, permanent).staticKeywordModifiers ?? [])
+  const staticValues = (printedAbilitiesActive ? topDef(state, permanent).staticKeywordModifiers ?? [] : [])
     .filter((modifier) => modifier.keyword === keyword && staticModifierApplies(state, permanent, modifier))
     .map((modifier) => modifier.value === true ? 1 : Number(modifier.value ?? 1));
   const dynamicValues = (permanent.keywordModifiers ?? [])
@@ -109,7 +133,8 @@ function permanentEnergyGeneration(state, permanent) {
   return [
     ...(def.energy ?? []),
     ...(permanent.energyModifiers ?? []),
-    ...(def.staticEnergyModifiers ?? []).filter((modifier) => staticModifierApplies(state, permanent, modifier))
+    ...(baseAbilitiesLost(permanent) ? [] : (def.staticEnergyModifiers ?? [])
+      .filter((modifier) => staticModifierApplies(state, permanent, modifier)))
   ].reduce((total, icon) => total + Number(icon.amount ?? 0), 0);
 }
 
@@ -121,6 +146,22 @@ function includesText(values = [], value) {
   return values.some((item) => sameText(item, value));
 }
 
+function namesOfCardDef(def) {
+  return [def?.name, ...(def?.alternateNames ?? [])].filter(Boolean);
+}
+
+function cardDefHasName(def, name) {
+  return namesOfCardDef(def).some((candidate) => sameText(candidate, name));
+}
+
+function cardDefNameIncludesAll(def, parts = []) {
+  const needles = parts.map((part) => String(part).toLowerCase());
+  return namesOfCardDef(def).some((name) => {
+    const normalized = String(name).toLowerCase();
+    return needles.every((needle) => normalized.includes(needle));
+  });
+}
+
 function hasTriggerAbility(def) {
   return Boolean(def.trigger?.type && def.trigger.type !== TRIGGER_TYPES.NONE);
 }
@@ -129,18 +170,18 @@ function cardDefMatchesFilter(def, filter = {}) {
   if (filter.anyOf && !filter.anyOf.some((childFilter) => cardDefMatchesFilter(def, childFilter))) return false;
   if (filter.type && def.type !== filter.type) return false;
   if (filter.color && def.color !== filter.color) return false;
-  if (filter.name && !sameText(def.name, filter.name)) return false;
-  if (filter.nameIncludesAll) {
-    const name = String(def.name ?? "").toLowerCase();
-    if (!filter.nameIncludesAll.every((part) => name.includes(String(part).toLowerCase()))) return false;
-  }
-  if (filter.names && !filter.names.some((name) => sameText(def.name, name))) return false;
-  if (filter.otherThanName && sameText(def.name, filter.otherThanName)) return false;
+  if (filter.name && !cardDefHasName(def, filter.name)) return false;
+  if (filter.nameIncludesAll && !cardDefNameIncludesAll(def, filter.nameIncludesAll)) return false;
+  if (filter.names && !filter.names.some((name) => cardDefHasName(def, name))) return false;
+  if (filter.otherThanName && cardDefHasName(def, filter.otherThanName)) return false;
   if (filter.requiredEnergyMax !== undefined && (def.requiredEnergy?.amount ?? 0) > filter.requiredEnergyMax) return false;
   if (filter.requiredEnergyMin !== undefined && (def.requiredEnergy?.amount ?? 0) < filter.requiredEnergyMin) return false;
   if (filter.apCost !== undefined && (def.apCost ?? 0) !== filter.apCost) return false;
+  if (filter.apCostMin !== undefined && (def.apCost ?? 0) < filter.apCostMin) return false;
+  if (filter.apCostMax !== undefined && (def.apCost ?? 0) > filter.apCostMax) return false;
   if (filter.affinity && !includesText(def.affinities, filter.affinity)) return false;
   if (filter.affinities && !def.affinities?.some((affinity) => includesText(filter.affinities, affinity))) return false;
+  if (filter.withoutAffinity && includesText(def.affinities, filter.withoutAffinity)) return false;
   if (filter.withoutRaid && def.raid) return false;
   if (filter.noAffinities && (def.affinities ?? []).length > 0) return false;
   if (filter.baseBp !== undefined && (def.bp ?? 0) !== filter.baseBp) return false;
@@ -157,7 +198,8 @@ function activeAp(player) {
   return player.apCards.filter((ap) => !ap.rested).length;
 }
 
-function payAp(player, amount) {
+function payAp(state, playerId, amount) {
+  const player = getPlayer(state, playerId);
   assertRule(activeAp(player) >= amount, "AP_COST", "Not enough active AP cards to pay this cost.", {
     required: amount,
     active: activeAp(player)
@@ -169,6 +211,10 @@ function payAp(player, amount) {
       ap.rested = true;
       remaining -= 1;
     }
+  }
+  if (amount > 0 && state.phase === PHASES.ATTACK) {
+    state.turnFlags ??= freshTurnFlags();
+    state.turnFlags[playerId].apPaidDuringAttackPhase = true;
   }
 }
 
@@ -258,6 +304,8 @@ function readyPermanent(permanent) {
 }
 
 function restPermanentByAbility(state, playerId, permanent, context = {}) {
+  if (context.byAbilityEffect
+    && abilityActionPreventedByAbility(state, playerId, permanent, "rest", context)) return false;
   const wasActive = !permanent.rested;
   const location = findPermanentLocation(getPlayer(state, playerId), permanent.pid);
   permanent.rested = true;
@@ -267,6 +315,7 @@ function restPermanentByAbility(state, playerId, permanent, context = {}) {
       restedPermanent: permanent
     });
   }
+  return true;
 }
 
 function readyField(player, { includeAp = false } = {}) {
@@ -307,11 +356,78 @@ function freshTurnFlags() {
     sidelineToHandByAbility: false,
     movedPermanentIds: [],
     movedOutsideMovementPermanentIds: [],
+    movementActionUsed: false,
     apPaidAbilityUsed: false,
+    apPaidDuringAttackPhase: false,
     usedFromHandCardIds: [],
     triggerAbilityActivated: false,
-    playedCharacterTriggerTypes: []
+    playedCharacterTriggerTypes: [],
+    chosenPermanentIdsBySourceAffinity: {},
+    restrictedCardUseSourceZones: []
   }]));
+}
+
+function freshPublicKnowledge() {
+  return Object.fromEntries(PLAYERS.map((viewerId) => [viewerId, {
+    players: Object.fromEntries(PLAYERS.map((observedPlayerId) => [observedPlayerId, {
+      revealedCards: []
+    }]))
+  }]));
+}
+
+function ensurePublicKnowledge(state) {
+  state.publicKnowledge ??= freshPublicKnowledge();
+  for (const viewerId of PLAYERS) {
+    state.publicKnowledge[viewerId] ??= { players: {} };
+    state.publicKnowledge[viewerId].players ??= {};
+    for (const observedPlayerId of PLAYERS) {
+      state.publicKnowledge[viewerId].players[observedPlayerId] ??= { revealedCards: [] };
+      state.publicKnowledge[viewerId].players[observedPlayerId].revealedCards ??= [];
+    }
+  }
+  return state.publicKnowledge;
+}
+
+function turnsTaken(state) {
+  return PLAYERS.reduce((total, playerId) => total + (state.players[playerId]?.turnsTaken ?? 0), 0);
+}
+
+function recordCardsRevealedToPlayer(state, viewerId, observedPlayerId, cards, { zone = "unknown", source = "effect" } = {}) {
+  if (!PLAYERS.includes(viewerId) || !PLAYERS.includes(observedPlayerId)) return;
+  const entry = ensurePublicKnowledge(state)[viewerId].players[observedPlayerId];
+  const turn = turnsTaken(state);
+  for (const card of cards.filter(Boolean)) {
+    if (!card.defId) continue;
+    const existing = entry.revealedCards.find((item) => item.uid === card.uid);
+    if (existing) {
+      existing.lastKnownZone = zone;
+      existing.lastSeenTurn = turn;
+      existing.lastRevealSource = source;
+      continue;
+    }
+    entry.revealedCards.push({
+      uid: card.uid,
+      owner: card.owner ?? observedPlayerId,
+      defId: card.defId,
+      firstKnownZone: zone,
+      lastKnownZone: zone,
+      firstSeenTurn: turn,
+      lastSeenTurn: turn,
+      firstRevealSource: source,
+      lastRevealSource: source
+    });
+  }
+}
+
+function recordCardsRevealedToOpponent(state, observedPlayerId, cards, options = {}) {
+  recordCardsRevealedToPlayer(state, opponentOf(observedPlayerId), observedPlayerId, cards, options);
+}
+
+export function publicKnownCardDefIds(state, viewerId, observedPlayerId) {
+  const revealed = ensurePublicKnowledge(state)[viewerId]?.players?.[observedPlayerId]?.revealedCards ?? [];
+  return revealed
+    .map((card) => card.defId)
+    .filter(Boolean);
 }
 
 function resetTurnFlags(state) {
@@ -460,7 +576,8 @@ function energyAvailable(state, playerId) {
     const generated = [
       ...(def.energy ?? []),
       ...(permanent.energyModifiers ?? []),
-      ...(def.staticEnergyModifiers ?? []).filter((modifier) => staticModifierApplies(state, permanent, modifier))
+      ...(baseAbilitiesLost(permanent) ? [] : (def.staticEnergyModifiers ?? [])
+        .filter((modifier) => staticModifierApplies(state, permanent, modifier)))
     ];
     for (const icon of generated) {
       totals[icon.color] = (totals[icon.color] ?? 0) + icon.amount;
@@ -494,6 +611,7 @@ function fieldStaticUseCostModifiers(state, playerId, cardDef, kind, options = {
   const sourceZone = options.sourceZone ?? "hand";
   const matches = [];
   for (const permanent of [...player.frontLine, ...player.energyLine]) {
+    if (baseAbilitiesLost(permanent)) continue;
     for (const modifier of topDef(state, permanent).staticUseCostModifiers ?? []) {
       if (modifier.kind !== kind) continue;
       if (modifier.sourceZone && modifier.sourceZone !== sourceZone) continue;
@@ -605,6 +723,20 @@ function consumeApCostReductions(state, playerId, cardDef, options = {}) {
 }
 
 function assertCanUseCard(state, playerId, cardDef, options = {}) {
+  const sourceZone = options.sourceZone ?? "hand";
+  assertRule(!cardDef.raidOnlyPlay || options.performingRaid, "RAID_ONLY", `${cardDef.name} can only be played by performing Raid with it.`, {
+    card: cardDef.id
+  });
+  if (options.performingRaid && cardDef.raidUseCondition) {
+    assertRule(conditionMet(state, playerId, cardDef.raidUseCondition, { ...options, cardDef, performingRaid: true }), "RAID_CONDITION", `${cardDef.name} cannot perform Raid because its Raid condition is not satisfied.`, {
+      card: cardDef.id,
+      condition: cardDef.raidUseCondition
+    });
+  }
+  assertRule(!state.turnFlags?.[playerId]?.restrictedCardUseSourceZones?.includes(sourceZone), "USE_RESTRICTION", `Cards cannot be used from ${sourceZone} for the rest of this turn.`, {
+    card: cardDef.id,
+    sourceZone
+  });
   assertRule(hasRequiredEnergy(state, playerId, cardDef, options), "ENERGY", "Required energy is not satisfied.", {
     card: cardDef.id,
     required: cardDef.requiredEnergy,
@@ -617,14 +749,14 @@ function assertCanUseCard(state, playerId, cardDef, options = {}) {
   });
   for (const restriction of useRestrictionsForCard(cardDef)) {
     if (restriction.kind === "namedNotInSideline") {
-      const hasNamed = getPlayer(state, playerId).sideline.some((card) => sameText(defOf(state, card).name, restriction.name));
+      const hasNamed = getPlayer(state, playerId).sideline.some((card) => cardDefHasName(defOf(state, card), restriction.name));
       assertRule(!hasNamed, "USE_RESTRICTION", `${cardDef.name} cannot be used while ${restriction.name} is in your sideline.`, {
         card: cardDef.id,
         name: restriction.name
       });
     }
     if (restriction.kind === "energyLineHasRoom") {
-      assertRule(getPlayer(state, playerId).energyLine.length < MAX_LINE_SIZE, "USE_RESTRICTION", `${cardDef.name} cannot be used while your energy line is full.`, {
+      assertRule(getPlayer(state, playerId).energyLine.length < lineCapacity(state, playerId, LINES.ENERGY), "USE_RESTRICTION", `${cardDef.name} cannot be used while your energy line is full.`, {
         card: cardDef.id
       });
     }
@@ -684,6 +816,10 @@ function payUseRestrictionCost(state, playerId, cost, choices = {}) {
       assertRule(index >= 0 && index < player.life.length, "USE_RESTRICTION_COST", "Life cost index is out of range.", { index });
       const card = player.life.splice(index, 1)[0];
       card.faceUp = true;
+      recordCardsRevealedToOpponent(state, playerId, [card], {
+        zone: "life",
+        source: "lifeToSidelineCost"
+      });
       placeCardInZone(state, player, "sideline", card);
     }
     return;
@@ -712,7 +848,7 @@ function findActiveNamedPermanents(state, playerId, name, line = "field") {
   const targets = [];
   for (const lineName of lines) {
     lineOf(player, lineName).forEach((permanent, index) => {
-      if (!permanent.rested && sameText(topDef(state, permanent).name, name)) {
+      if (!permanent.rested && cardDefHasName(topDef(state, permanent), name)) {
         targets.push({ lineName, index, permanent });
       }
     });
@@ -723,8 +859,9 @@ function findActiveNamedPermanents(state, playerId, name, line = "field") {
 function walkEffectTree(effect, callback) {
   if (!effect) return;
   callback(effect);
-  if (effect.effect) walkEffectTree(effect.effect, callback);
-  if (effect.elseEffect) walkEffectTree(effect.elseEffect, callback);
+  for (const key of ["effect", "elseEffect", "baseEffect", "costEffect", "insteadEffect", "upgradedEffect", "ifMovedEffect", "successEffect"]) {
+    if (effect[key]) walkEffectTree(effect[key], callback);
+  }
   for (const child of effect.effects ?? []) walkEffectTree(child, callback);
   for (const choice of effect.choices ?? []) walkEffectTree(choice.effect, callback);
 }
@@ -779,6 +916,7 @@ function resolveSidelineToHandByAbility(state, playerId, card, sourceName, desti
   flagSidelineToHandByAbility(state, playerId);
   resolveZoneCardAbilities(state, playerId, "hand", card, TIMINGS.WHEN_SIDELINE_TO_HAND_BY_ABILITY, {
     ...context,
+    triggerSourceDef: context.triggerSourceDef ?? context.sourceDef,
     card
   });
 }
@@ -831,14 +969,158 @@ function selectorMatchesForOverride(selector = {}, expected = {}) {
   return true;
 }
 
-function protectedFromOpposingAbility(state, playerId, targetPlayerId, permanent, selector = {}) {
+function legacyTargetingRestriction(keyword) {
+  if (keyword === "opponentAbilityProtection") {
+    return { mode: "prohibit", sourceTypes: [CARD_TYPES.CHARACTER, CARD_TYPES.EVENT, CARD_TYPES.SITE, "trigger"] };
+  }
+  if (keyword === "opponentAbilityTargetTax") {
+    return {
+      mode: "tax",
+      sourceTypes: [CARD_TYPES.CHARACTER, CARD_TYPES.EVENT, CARD_TYPES.SITE, "trigger"],
+      payment: { kind: "handToSideline", amount: 1 }
+    };
+  }
+  return undefined;
+}
+
+function targetingRestrictionsForPermanent(state, permanent) {
+  const restrictions = [];
+  const def = topDef(state, permanent);
+  if (!baseAbilitiesLost(permanent)) {
+    restrictions.push(...(def.targetingRestrictions ?? []));
+    for (const keyword of ["opponentAbilityProtection", "opponentAbilityTargetTax"]) {
+      if (def.keywords?.[keyword]) restrictions.push(legacyTargetingRestriction(keyword));
+    }
+    for (const modifier of def.staticKeywordModifiers ?? []) {
+      if (!staticModifierApplies(state, permanent, modifier)) continue;
+      if (modifier.keyword === "targetingRestriction") restrictions.push(modifier.value);
+      else if (legacyTargetingRestriction(modifier.keyword)) restrictions.push(legacyTargetingRestriction(modifier.keyword));
+    }
+  }
+  for (const { modifier } of staticFieldKeywordModifiersForPermanent(state, permanent)) {
+    if (modifier.keyword === "targetingRestriction") restrictions.push(modifier.value);
+    else if (legacyTargetingRestriction(modifier.keyword)) restrictions.push(legacyTargetingRestriction(modifier.keyword));
+  }
+  for (const modifier of permanent.keywordModifiers ?? []) {
+    if (modifier.keyword === "targetingRestriction") restrictions.push(modifier.value);
+    else if (legacyTargetingRestriction(modifier.keyword)) restrictions.push(legacyTargetingRestriction(modifier.keyword));
+  }
+  return restrictions.filter(Boolean);
+}
+
+function abilitySourceType(context = {}) {
+  if (context.sourceKind === "trigger") return "trigger";
+  return context.sourceDef?.type;
+}
+
+function targetingRestrictionApplies(state, restriction, context = {}, targetPermanent) {
+  const sourceType = abilitySourceType(context);
+  if (restriction.sourceTypes?.length > 0 && sourceType && !restriction.sourceTypes.includes(sourceType)) return false;
+  if (restriction.sourceTypes?.length > 0 && !sourceType) return true;
+  if (restriction.sourceZone && context.sourceZone !== restriction.sourceZone) return false;
+  if (restriction.during === "opponentTurn" && targetPermanent && state.activePlayer === targetPermanent.controller) return false;
+  if (restriction.during === "controllerTurn" && targetPermanent && state.activePlayer !== targetPermanent.controller) return false;
+  if (restriction.sourceRaided !== undefined) {
+    const source = context.permanent;
+    if (!source || (source.cards.length > 1) !== restriction.sourceRaided) return false;
+  }
+  if (restriction.sourceBpMin !== undefined) {
+    const source = context.permanent;
+    if (!source || battlePower(state, source) < restriction.sourceBpMin) return false;
+  }
+  return true;
+}
+
+function applicableTargetingRestrictions(state, permanent, context = {}) {
+  return targetingRestrictionsForPermanent(state, permanent)
+    .filter((restriction) => targetingRestrictionApplies(state, restriction, context, permanent));
+}
+
+function targetingTaxPaymentsForTarget(state, playerId, targetPlayerId, permanent, context = {}) {
+  if (targetPlayerId === playerId || !permanent) return {};
+  const payments = new Map();
+  for (const restriction of applicableTargetingRestrictions(state, permanent, context)) {
+    if (restriction.mode !== "tax") continue;
+    const kind = restriction.payment?.kind;
+    if (!kind) continue;
+    payments.set(kind, Math.max(payments.get(kind) ?? 0, Number(restriction.payment?.amount ?? 1)));
+  }
+  return Object.fromEntries(payments);
+}
+
+function canPayTargetingTax(state, playerId, restriction) {
+  const amount = restriction.payment?.amount ?? 1;
+  if (restriction.payment?.kind === "ap") return activeAp(getPlayer(state, playerId)) >= amount;
+  if (restriction.payment?.kind === "handToSideline") return getPlayer(state, playerId).hand.length >= amount;
+  return false;
+}
+
+function protectedFromOpposingAbility(state, playerId, targetPlayerId, permanent, selector = {}, context = {}) {
   if (targetPlayerId === playerId || selector.ignoreProtection) return false;
-  return hasKeyword(state, permanent, "opponentAbilityProtection")
-    || hasKeyword(state, permanent, "opponentAbilityTargetTax");
+  const restrictions = applicableTargetingRestrictions(state, permanent, context);
+  return restrictions.some((restriction) => restriction.mode === "prohibit")
+    || restrictions.some((restriction) => restriction.mode === "tax" && !canPayTargetingTax(state, playerId, restriction));
+}
+
+function payTargetingTaxes(state, playerId, targets, selector, context = {}) {
+  if (selector?.ignoreProtection) return;
+  const player = getPlayer(state, playerId);
+  for (const target of targets) {
+    if (target.playerId === playerId) continue;
+    const payments = targetingTaxPaymentsForTarget(state, playerId, target.playerId, target.permanent, context);
+    for (const [kind, amount] of Object.entries(payments)) {
+      if (kind === "ap") {
+        payAp(state, playerId, amount);
+        continue;
+      }
+      if (kind === "handToSideline") {
+        for (let paid = 0; paid < amount; paid += 1) {
+          const paymentNumber = context.targetTaxPaymentCount ?? 0;
+          const requestedChoice = context.choices?.targetTaxHandIndices?.[paymentNumber]
+            ?? context.choices?.targetTaxHandIndex
+            ?? 0;
+          const requested = requestedChoice && typeof requestedChoice === "object"
+            ? requestedChoice.uid
+              ? player.hand.findIndex((card) => card.uid === requestedChoice.uid)
+              : Number(requestedChoice.index)
+            : requestedChoice;
+          assertRule(requested >= 0 && requested < player.hand.length, "TARGET_TAX", "Targeting-tax hand index is out of range.", { requested });
+          const card = player.hand.splice(requested, 1)[0];
+          placeHandCardInZone(state, playerId, player, "sideline", card, {}, context);
+          context.targetTaxPaymentCount = paymentNumber + 1;
+        }
+      }
+    }
+  }
+}
+
+function selectorBpMaximum(state, playerId, selector, context = {}) {
+  let maximum = selector.bpMax;
+  if (selector.bpMaxFromLastSidelined) maximum = context.lastSidelinedBp ?? -Infinity;
+  if (selector.bpMaxFromChoiceKey) {
+    const permanent = context.chosenTargetsByKey?.[selector.bpMaxFromChoiceKey]?.[0];
+    if (permanent) maximum = battlePower(state, permanent);
+  }
+
+  for (const bonus of selector.bpMaxBonuses ?? []) {
+    if (bonus.condition && !conditionMet(state, playerId, bonus.condition, context)) continue;
+    if (bonus.amountPerFieldMatch !== undefined) {
+      const countPlayerId = bonus.controller === "opponent" ? opponentOf(playerId) : playerId;
+      const countPlayer = getPlayer(state, countPlayerId);
+      const count = lineNamesForSelector(bonus.line ?? "field")
+        .flatMap((lineName) => lineOf(countPlayer, lineName))
+        .filter((permanent) => cardDefMatchesFilter(topDef(state, permanent), bonus.filter ?? {}))
+        .length;
+      maximum = Number(maximum ?? 0) + Number(bonus.amountPerFieldMatch) * count;
+    } else {
+      maximum = Number(maximum ?? 0) + Number(bonus.amount ?? 0);
+    }
+  }
+  return maximum;
 }
 
 function permanentMatchesSelector(state, playerId, selector = {}, targetPlayerId, lineName, permanent, context = {}) {
-  if (protectedFromOpposingAbility(state, playerId, targetPlayerId, permanent, selector)) return false;
+  if (protectedFromOpposingAbility(state, playerId, targetPlayerId, permanent, selector, context)) return false;
   if (selector.anyOf && !selector.anyOf.some((childSelector) => permanentMatchesSelector(
     state,
     playerId,
@@ -853,15 +1135,13 @@ function permanentMatchesSelector(state, playerId, selector = {}, targetPlayerId
   if (selector.type && def.type !== selector.type) return false;
   if (selector.rested !== undefined && permanent.rested !== selector.rested) return false;
   if (selector.active !== undefined && permanent.rested === selector.active) return false;
-  if (selector.name && !sameText(def.name, selector.name)) return false;
-  if (selector.nameIncludesAll) {
-    const name = String(def.name ?? "").toLowerCase();
-    if (!selector.nameIncludesAll.every((part) => name.includes(String(part).toLowerCase()))) return false;
-  }
-  if (selector.names && !selector.names.some((name) => sameText(def.name, name))) return false;
-  if (selector.otherThanName && sameText(def.name, selector.otherThanName)) return false;
+  if (selector.name && !cardDefHasName(def, selector.name)) return false;
+  if (selector.nameIncludesAll && !cardDefNameIncludesAll(def, selector.nameIncludesAll)) return false;
+  if (selector.names && !selector.names.some((name) => cardDefHasName(def, name))) return false;
+  if (selector.otherThanName && cardDefHasName(def, selector.otherThanName)) return false;
   if (selector.affinity && !includesText(def.affinities, selector.affinity)) return false;
   if (selector.affinities && !def.affinities?.some((affinity) => includesText(selector.affinities, affinity))) return false;
+  if (selector.withoutAffinity && includesText(def.affinities, selector.withoutAffinity)) return false;
   if (selector.hasAbilityTiming && !abilitiesOfPermanent(state, permanent).some((ability) => ability.timing === selector.hasAbilityTiming)) return false;
   if (selector.hasUnderCards && permanent.cards.length <= 1) return false;
   if (selector.hasFaceDownUnder && !permanent.cards.slice(0, -1).some((card) => card.faceUp === false)) return false;
@@ -870,10 +1150,17 @@ function permanentMatchesSelector(state, playerId, selector = {}, targetPlayerId
   if (selector.raided && permanent.cards.length <= 1) return false;
   if (selector.notRaided && permanent.cards.length > 1) return false;
   if (selector.hasRaid && !topDef(state, permanent).raid) return false;
+  if (selector.withoutRaid && topDef(state, permanent).raid) return false;
+  if (selector.notChosenBySourceAffinityThisTurn) {
+    const affinityKey = String(selector.notChosenBySourceAffinityThisTurn).toLowerCase();
+    const chosenIds = state.turnFlags?.[playerId]?.chosenPermanentIdsBySourceAffinity?.[affinityKey] ?? [];
+    if (chosenIds.includes(permanent.pid)) return false;
+  }
   if (selector.otherThanSource && context.permanent?.pid === permanent.pid) return false;
   if (selector.otherThanLastPlayed && context.lastPlayedPermanent?.pid === permanent.pid) return false;
-  const bpMax = selector.bpMax !== undefined
-    ? selector.bpMax + Number(selector.bpMaxPerLastMovedFromHand ?? 0) * (context.lastEffectMovedFromHandCount ?? context.lastMovedFromHandCount ?? 0)
+  const baseBpMax = selectorBpMaximum(state, playerId, selector, context);
+  const bpMax = baseBpMax !== undefined
+    ? baseBpMax + Number(selector.bpMaxPerLastMovedFromHand ?? 0) * (context.lastEffectMovedFromHandCount ?? context.lastMovedFromHandCount ?? 0)
     : undefined;
   if (bpMax !== undefined && battlePower(state, permanent) > bpMax) return false;
   if (selector.bpMin !== undefined && battlePower(state, permanent) < selector.bpMin) return false;
@@ -894,6 +1181,15 @@ function notifyTargetsChosenByAbility(state, playerId, selector, targets, contex
     const key = `${context.sourceDef.id ?? "source"}:${target.permanent.pid}`;
     if (context.chosenByAbilityNotified.includes(key)) continue;
     context.chosenByAbilityNotified.push(key);
+    state.turnFlags ??= freshTurnFlags();
+    const chosenByAffinity = state.turnFlags[playerId].chosenPermanentIdsBySourceAffinity ??= {};
+    for (const affinity of context.sourceDef.affinities ?? []) {
+      const affinityKey = String(affinity).toLowerCase();
+      chosenByAffinity[affinityKey] ??= [];
+      if (!chosenByAffinity[affinityKey].includes(target.permanent.pid)) {
+        chosenByAffinity[affinityKey].push(target.permanent.pid);
+      }
+    }
     resolvePermanentAbilities(state, target.playerId, target.permanent, TIMINGS.WHEN_CHOSEN_BY_ABILITY, {
       ...context,
       chosenPermanent: target.permanent,
@@ -941,7 +1237,19 @@ function selectPermanentTargets(state, playerId, selector = "self", context = {}
 
   const choiceKey = selector.choiceKey ?? "targets";
   const chosen = context.choices?.[choiceKey] ?? selector.targets;
-  if (Array.isArray(chosen) && chosen.length > 0) {
+  const min = selector.min ?? 0;
+  const max = selector.max ?? selector.amount ?? Number.POSITIVE_INFINITY;
+  if (Array.isArray(chosen)) {
+    assertRule(chosen.length >= min && chosen.length <= max, "TARGET", "Chosen target count is outside the allowed range.", {
+      choiceKey,
+      selected: chosen.length,
+      min,
+      max
+    });
+    if (chosen.length === 0) {
+      rememberChosenTargets(state, context, choiceKey, []);
+      return [];
+    }
     const targets = chosen.map((target) => {
       const targetPlayerId = target.player ?? target.playerId ?? playerId;
       const targetLineName = target.lineName ?? target.line;
@@ -959,7 +1267,13 @@ function selectPermanentTargets(state, playerId, selector = "self", context = {}
         permanent: targetPermanent
       };
     });
+    if (selector.uniqueNames) {
+      const names = new Set(targets.map((target) => topDef(state, target.permanent).name.toLowerCase()));
+      assertRule(names.size === targets.length, "TARGET", "Chosen targets must have unique card names.", { choiceKey, chosen });
+    }
+    payTargetingTaxes(state, playerId, targets, selector, context);
     notifyTargetsChosenByAbility(state, playerId, selector, targets, context);
+    rememberChosenTargets(state, context, choiceKey, targets);
     return targets;
   }
 
@@ -974,12 +1288,24 @@ function selectPermanentTargets(state, playerId, selector = "self", context = {}
     }
   }
 
-  const min = selector.min ?? 0;
-  const max = selector.max ?? selector.amount ?? candidates.length;
-  assertRule(candidates.length >= min, "TARGET", "Not enough legal targets for effect.", { selector, candidates: candidates.length });
-  const targets = candidates.slice(0, max);
+  const legalCandidates = selector.uniqueNames
+    ? candidates.filter((candidate, index) => candidates.findIndex((other) => sameText(topDef(state, other.permanent).name, topDef(state, candidate.permanent).name)) === index)
+    : candidates;
+  const automaticMax = Number.isFinite(max) ? max : candidates.length;
+  assertRule(legalCandidates.length >= min, "TARGET", "Not enough legal targets for effect.", { selector, candidates: legalCandidates.length });
+  const targets = legalCandidates.slice(0, automaticMax);
+  payTargetingTaxes(state, playerId, targets, selector, context);
   notifyTargetsChosenByAbility(state, playerId, selector, targets, context);
+  rememberChosenTargets(state, context, choiceKey, targets);
   return targets;
+}
+
+function rememberChosenTargets(state, context, choiceKey, targets) {
+  context.chosenTargetsByKey ??= {};
+  context.chosenTargetNamesByKey ??= {};
+  context.chosenTargetsByKey[choiceKey] = targets.map((target) => target.permanent);
+  context.chosenTargetNamesByKey[choiceKey] = targets.map((target) => topDef(state, target.permanent).name);
+  context.lastChosenTargets = targets.map((target) => target.permanent);
 }
 
 function zoneOf(player, zoneName) {
@@ -1003,9 +1329,17 @@ function moveTopDeckCards(state, playerId, effect, context = {}) {
   const destination = zoneOf(destinationPlayer, effect.destination ?? "hand");
   const count = effect.count ?? effect.amount ?? 1;
 
+  const moved = [];
   for (let i = 0; i < count; i += 1) {
-    if (sourcePlayer.deck.length === 0) return;
+    if (sourcePlayer.deck.length === 0) break;
     const card = sourcePlayer.deck.shift();
+    moved.push(card);
+    if (effect.publicReveal) {
+      recordCardsRevealedToOpponent(state, sourcePlayerId, [card], {
+        zone: "deck",
+        source: effect.kind ?? "moveTopDeck"
+      });
+    }
     if (effect.destination === "life") card.faceUp = Boolean(effect.faceUp);
     placeCardInZone(state, destinationPlayer, effect.destination ?? "hand", card);
     if ((effect.destination ?? "hand") === "sideline"
@@ -1018,6 +1352,8 @@ function moveTopDeckCards(state, playerId, effect, context = {}) {
       });
     }
   }
+  context.lastMovedCards = moved;
+  context.lastMovedCardCount = (context.lastMovedCardCount ?? 0) + moved.length;
 }
 
 function lookTopDeckAndMove(state, playerId, effect, context = {}) {
@@ -1025,6 +1361,17 @@ function lookTopDeckAndMove(state, playerId, effect, context = {}) {
   const player = getPlayer(state, ownerId);
   const count = Math.min(effect.count ?? effect.amount ?? 1, player.deck.length);
   const looked = player.deck.splice(0, count);
+  if (effect.publicReveal) {
+    recordCardsRevealedToOpponent(state, ownerId, looked, {
+      zone: "deck",
+      source: effect.kind ?? "lookTopDeckAndMove"
+    });
+  }
+  resolveRuntimeChoices(state, playerId, effect, context, {
+    kind: "lookTopDeckAndMove",
+    cards: looked,
+    ownerId
+  });
   const choiceKey = effect.choiceKey ?? "lookTopDeckPlacements";
   const explicitPlacements = context.choices?.[choiceKey] ?? effect.placements ?? [];
   const placements = [...(effect.defaultPlacements ?? []), ...explicitPlacements];
@@ -1103,14 +1450,29 @@ function lookTopDeckAndMove(state, playerId, effect, context = {}) {
     }
   }
 
-  player.deck.unshift(...topCards);
-  player.deck.push(...bottomCards);
+  const orderedTop = orderCardsByChoice(
+    topCards,
+    context.choices?.[effect.topOrderChoiceKey ?? "lookTopOrder"],
+    { code: "DECK_PLACEMENT", label: "looked-card top order" }
+  );
+  const orderedBottom = orderCardsByChoice(
+    bottomCards,
+    context.choices?.[effect.bottomOrderChoiceKey ?? "lookBottomOrder"],
+    { code: "DECK_PLACEMENT", label: "looked-card bottom order" }
+  );
+  player.deck.unshift(...orderedTop);
+  player.deck.push(...orderedBottom);
 }
 
 function lookTopDeckPlayOneAndMoveRest(state, playerId, effect, context = {}) {
   const player = getPlayer(state, playerId);
   const count = Math.min(effect.count ?? effect.amount ?? 1, player.deck.length);
   const looked = player.deck.splice(0, count);
+  resolveRuntimeChoices(state, playerId, effect, context, {
+    kind: "lookTopDeckPlayOneAndMoveRest",
+    cards: looked,
+    ownerId: playerId
+  });
   const choice = context.choices?.[effect.choiceKey ?? "lookPlayIndex"];
   const selectedIndex = Number.isInteger(choice)
     ? choice
@@ -1127,14 +1489,16 @@ function lookTopDeckPlayOneAndMoveRest(state, playerId, effect, context = {}) {
   if (selected) {
     const cardDef = defOf(state, selected);
     const raidChoice = context.choices?.[effect.raidChoiceKey ?? "performRaid"];
-    const raidTarget = context.choices?.[effect.raidTargetChoiceKey ?? "raidTarget"] ?? defaultRaidTargetForCard(state, playerId, cardDef);
-    const shouldRaid = effect.allowRaid && cardDef.raid && raidTarget && raidChoice !== false;
+    const raidTarget = context.choices?.[effect.raidTargetChoiceKey ?? "raidTarget"] ?? defaultRaidTargetForCard(state, playerId, cardDef, { sourceKind: context.sourceKind });
+    const shouldRaid = effect.allowRaid && cardDef.raid && raidTarget && raidChoice !== false
+      && raidUseConditionMet(state, playerId, cardDef, { sourceKind: context.sourceKind });
     if (shouldRaid) {
       const lineName = raidTarget.lineName ?? raidTarget.line ?? LINES.FRONT;
       const target = lineOf(player, lineName)[raidTarget.index];
       assertRule(target, "RAID_TARGET", "Raid target does not exist.");
-      assertRule(matchesRaidRequirement(state, cardDef.raid, target), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
+      assertRule(matchesRaidRequirement(state, cardDef.raid, target, { raidCardDef: cardDef, sourceKind: context.sourceKind }), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
       const raidedDef = topDef(state, target);
+      resetPermanentForRaid(target);
       target.cards.push(selected);
       readyPermanent(target);
       rememberPlayedPermanent(context, target, playerId);
@@ -1142,7 +1506,10 @@ function lookTopDeckPlayOneAndMoveRest(state, playerId, effect, context = {}) {
       resolveRaidedAbilities(state, playerId, target, raidedDef, { permanent: target, raid: true, choices: context.choices });
     } else {
       const permanent = createPermanent(state, playerId, selected, effect.rested ?? true);
-      insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+      insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"], {
+        operation: "play",
+        choices: context.choices
+      });
       rememberPlayedPermanent(context, permanent, playerId);
       if (!context.suppressPlayedAbilities && !effect.suppressPlayedAbilities) {
         resolvePermanentAbilities(state, playerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
@@ -1151,12 +1518,17 @@ function lookTopDeckPlayOneAndMoveRest(state, playerId, effect, context = {}) {
   }
 
   const remainingDestination = effect.remainingDestination ?? "bottom";
+  const orderedRemaining = orderCardsByChoice(
+    looked,
+    context.choices?.[effect.remainingOrderChoiceKey ?? "lookRemainingOrder"],
+    { code: "DECK_PLACEMENT", label: "remaining looked-card order" }
+  );
   if (remainingDestination === "top") {
-    player.deck.unshift(...looked);
+    player.deck.unshift(...orderedRemaining);
   } else if (remainingDestination === "bottom") {
-    player.deck.push(...looked);
+    player.deck.push(...orderedRemaining);
   } else {
-    for (const card of looked) {
+    for (const card of orderedRemaining) {
       placeCardInZone(state, player, remainingDestination, card);
       if (remainingDestination === "sideline") {
         flagDeckToSidelineByAbility(state, playerId);
@@ -1174,6 +1546,15 @@ function revealTopDeckOptionalPlayOrRaidInstead(state, playerId, effect, context
   if (player.deck.length === 0) return;
   const card = player.deck.shift();
   card.faceUp = true;
+  recordCardsRevealedToOpponent(state, playerId, [card], {
+    zone: "deck",
+    source: effect.kind ?? "revealTopDeckOptionalPlayOrRaidInstead"
+  });
+  resolveRuntimeChoices(state, playerId, effect, context, {
+    kind: "revealTopDeckOptionalPlayOrRaidInstead",
+    cards: [card],
+    ownerId: playerId
+  });
   const matches = zoneCardMatchesPlayFilter(state, playerId, card, effect.filter ?? {});
   const choice = context.choices?.[effect.choiceKey ?? "optionalRevealPlay"];
   const canPay = !effect.costEffect || canPayEffectCost(state, playerId, effect.costEffect);
@@ -1183,15 +1564,17 @@ function revealTopDeckOptionalPlayOrRaidInstead(state, playerId, effect, context
     card.faceUp = true;
     const cardDef = defOf(state, card);
     const raidChoice = context.choices?.[effect.raidChoiceKey ?? "performRaid"];
-    const raidTarget = context.choices?.[effect.raidTargetChoiceKey ?? "raidTarget"] ?? defaultRaidTargetForCard(state, playerId, cardDef);
-    const shouldRaid = effect.allowRaid && cardDef.raid && raidTarget && raidChoice !== false;
+    const raidTarget = context.choices?.[effect.raidTargetChoiceKey ?? "raidTarget"] ?? defaultRaidTargetForCard(state, playerId, cardDef, { sourceKind: context.sourceKind });
+    const shouldRaid = effect.allowRaid && cardDef.raid && raidTarget && raidChoice !== false
+      && raidUseConditionMet(state, playerId, cardDef, { sourceKind: context.sourceKind });
 
     if (shouldRaid) {
       const lineName = raidTarget.lineName ?? raidTarget.line ?? LINES.FRONT;
       const target = lineOf(player, lineName)[raidTarget.index];
       assertRule(target, "RAID_TARGET", "Raid target does not exist.");
-      assertRule(matchesRaidRequirement(state, cardDef.raid, target), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
+      assertRule(matchesRaidRequirement(state, cardDef.raid, target, { raidCardDef: cardDef, sourceKind: context.sourceKind }), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
       const raidedDef = topDef(state, target);
+      resetPermanentForRaid(target);
       target.cards.push(card);
       readyPermanent(target);
       rememberPlayedPermanent(context, target, playerId);
@@ -1201,7 +1584,10 @@ function revealTopDeckOptionalPlayOrRaidInstead(state, playerId, effect, context
     }
 
     const permanent = createPermanent(state, playerId, card, effect.rested ?? true);
-    insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+    insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"], {
+      operation: "play",
+      choices: context.choices
+    });
     rememberPlayedPermanent(context, permanent, playerId);
     if (!context.suppressPlayedAbilities && !effect.suppressPlayedAbilities) {
       resolvePermanentAbilities(state, playerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
@@ -1219,6 +1605,7 @@ function revealTopDeckOptionalPlayOrRaidInstead(state, playerId, effect, context
 }
 
 function moveHandCardsToZone(state, playerId, effect, context = {}) {
+  context.lastEffectMovedFromHandCount = 0;
   const player = getPlayer(state, playerId);
   const count = effect.count ?? effect.amount ?? 1;
   const indices = context.choices?.[effect.choiceKey ?? "handIndices"] ?? effect.indices ?? (
@@ -1272,6 +1659,34 @@ function cardMatchesFilter(state, cardRef, filter = {}) {
   return cardDefMatchesFilter(defOf(state, cardRef), filter);
 }
 
+function cardMatchesEffectFilter(state, cardRef, filter = {}, context = {}) {
+  if (!cardMatchesFilter(state, cardRef, filter)) return false;
+  if (filter.differentNameFromChoiceKey) {
+    const names = context.chosenTargetNamesByKey?.[filter.differentNameFromChoiceKey] ?? [];
+    if (names.some((name) => cardDefHasName(defOf(state, cardRef), name))) return false;
+  }
+  return true;
+}
+
+function orderCardsByChoice(cards, order, { code = "DECK_ORDER", label = "deck-card order" } = {}) {
+  if (!Array.isArray(order)) return cards;
+  assertRule(order.length === cards.length, code, `The ${label} must include every card exactly once.`, {
+    expected: cards.length,
+    order
+  });
+  const indices = order.map((choice) => {
+    if (choice?.uid) return cards.findIndex((card) => card.uid === choice.uid);
+    if (choice && typeof choice === "object") return Number(choice.index);
+    return Number(choice);
+  });
+  assertRule(indices.every((index) => Number.isInteger(index) && index >= 0 && index < cards.length), code, `The ${label} contains an unknown card.`, {
+    cards: cards.length,
+    order
+  });
+  assertRule(new Set(indices).size === cards.length, code, `The ${label} cannot repeat a card.`, { order });
+  return indices.map((index) => cards[index]);
+}
+
 function searchTopDeckCards(state, playerId, effect, context = {}) {
   const player = getPlayer(state, playerId);
   const rawCount = effect.countIf && conditionMet(state, playerId, effect.countIf.condition, context)
@@ -1279,6 +1694,11 @@ function searchTopDeckCards(state, playerId, effect, context = {}) {
     : effect.count ?? effect.amount ?? 1;
   const count = Math.min(rawCount, player.deck.length);
   const looked = player.deck.splice(0, count);
+  resolveRuntimeChoices(state, playerId, effect, context, {
+    kind: "searchTopDeck",
+    cards: looked,
+    ownerId: playerId
+  });
   const max = effect.max ?? effect.amount ?? 1;
   const choiceKey = effect.choiceKey ?? "searchIndices";
   const selectedIndices = context.choices?.[choiceKey] ?? looked
@@ -1291,18 +1711,63 @@ function searchTopDeckCards(state, playerId, effect, context = {}) {
     max,
     selectedIndices
   });
+  assertRule(new Set(selectedIndices).size === selectedIndices.length, "SEARCH_SELECTION", "A top-deck search card cannot be selected more than once.", {
+    selectedIndices
+  });
+  for (const index of selectedIndices) {
+    assertRule(Number.isInteger(index) && index >= 0 && index < looked.length, "SEARCH_SELECTION", "Selected top-deck search index is out of range.", {
+      index,
+      looked: looked.length
+    });
+  }
+  if (effect.uniqueNames) {
+    const names = new Set(selectedIndices.map((index) => defOf(state, looked[index]).name.toLowerCase()));
+    assertRule(names.size === selectedIndices.length, "SEARCH_SELECTION", "Selected search cards must have unique card names.", {
+      selectedIndices
+    });
+  }
 
   const selected = new Set(selectedIndices);
   const destination = zoneOf(player, effect.destination ?? "hand");
   const remaining = [];
   context.lastSearchSelectedCount = selectedIndices.length;
+  context.lastSearchSelectedCards = selectedIndices.map((index) => looked[index]).filter(Boolean);
+  if (effect.publicReveal) {
+    recordCardsRevealedToOpponent(state, playerId, looked, {
+      zone: "deck",
+      source: effect.kind ?? "searchTopDeck"
+    });
+  }
   looked.forEach((card, index) => {
     if (selected.has(index)) {
       assertRule(cardMatchesFilter(state, card, effect.filter), "SEARCH_SELECTION", "Selected card does not match search filter.", {
         index,
         filter: effect.filter
       });
+      if (effect.revealSelected && !effect.publicReveal) {
+        recordCardsRevealedToOpponent(state, playerId, [card], {
+          zone: "deck",
+          source: effect.kind ?? "searchTopDeck"
+        });
+      }
       destination.push(card);
+      const alternative = effect.selectedAlternative;
+      const alternativeChoice = context.choices?.[alternative?.choiceKey ?? "searchPlayInstead"];
+      if (alternative
+        && alternativeChoice !== false
+        && zoneCardMatchesPlayFilter(state, playerId, card, alternative.filter ?? {})) {
+        const selectedIndex = destination.length - 1;
+        const internalChoiceKey = `__searchAlternativeIndex${index}`;
+        playOrRaidCardFromZone(state, playerId, {
+          ...alternative,
+          zones: [effect.destination ?? "hand"],
+          choiceKey: internalChoiceKey,
+          keepInZoneIfCannotPlay: true
+        }, {
+          ...context,
+          choices: { ...context.choices, [internalChoiceKey]: selectedIndex }
+        });
+      }
     } else {
       remaining.push(card);
     }
@@ -1311,6 +1776,8 @@ function searchTopDeckCards(state, playerId, effect, context = {}) {
   if (effect.remainingDestinations || (effect.remainingDestination && effect.remainingDestination !== "bottom")) {
     const allowed = effect.remainingDestinations ? new Set(effect.remainingDestinations) : undefined;
     const choices = context.choices?.[effect.remainingDestinationChoiceKey ?? "searchRemainingDestinations"];
+    const topCards = [];
+    const bottomCards = [];
     for (const [index, card] of remaining.entries()) {
       const remainingDestination = Array.isArray(choices)
         ? choices[index] ?? effect.remainingDestination ?? effect.defaultRemainingDestination ?? "bottom"
@@ -1320,9 +1787,9 @@ function searchTopDeckCards(state, playerId, effect, context = {}) {
         allowed: allowed ? [...allowed] : undefined
       });
       if (remainingDestination === "top") {
-        player.deck.unshift(card);
+        topCards.push(card);
       } else if (remainingDestination === "bottom") {
-        player.deck.push(card);
+        bottomCards.push(card);
       } else {
         placeCardInZone(state, player, remainingDestination, card);
       }
@@ -1334,17 +1801,24 @@ function searchTopDeckCards(state, playerId, effect, context = {}) {
         });
       }
     }
+    const orderedTop = orderCardsByChoice(
+      topCards,
+      context.choices?.[effect.topOrderChoiceKey ?? "searchTopOrder"],
+      { code: "SEARCH_ORDER", label: "top-deck search order" }
+    );
+    const orderedBottom = orderCardsByChoice(
+      bottomCards,
+      context.choices?.[effect.bottomOrderChoiceKey ?? "bottomOrder"],
+      { code: "SEARCH_ORDER", label: "bottom-deck search order" }
+    );
+    player.deck.unshift(...orderedTop);
+    player.deck.push(...orderedBottom);
   } else {
     const order = context.choices?.[effect.bottomOrderChoiceKey ?? "bottomOrder"];
-    if (Array.isArray(order)) {
-      assertRule(order.length === remaining.length, "SEARCH_ORDER", "Bottom-deck order must include each remaining card.", {
-        expected: remaining.length,
-        order
-      });
-      player.deck.push(...order.map((index) => remaining[index]));
-    } else {
-      player.deck.push(...remaining);
-    }
+    player.deck.push(...orderCardsByChoice(remaining, order, {
+      code: "SEARCH_ORDER",
+      label: "bottom-deck search order"
+    }));
   }
 }
 
@@ -1409,8 +1883,47 @@ function resetPermanentAfterRaidTopLeaves(permanent) {
   permanent.usedOncePerTurn = [];
 }
 
+function resetPermanentForRaid(permanent) {
+  resetPermanentAfterRaidTopLeaves(permanent);
+  permanent.attacksThisTurn = 0;
+  permanent.blocksThisTurn = 0;
+  permanent.playedThisTurn = true;
+}
+
 function sourceIsOpponent(sourcePlayer, playerId) {
   return sourcePlayer && sourcePlayer !== playerId;
+}
+
+function permanentZoneMovePreventedByAbility(state, playerId, permanent, zoneName, options = {}) {
+  if (!options.byAbility) return false;
+  const def = topDef(state, permanent);
+  if (sourceIsOpponent(options.sourcePlayer, playerId) && def.opponentAbilityRemovalProtection) return true;
+  if (zoneName === "hand" && def.abilityReturnToHandProtection) return true;
+  const action = zoneName === "hand" ? "returnToHand" : zoneName === "sideline" ? "sideline" : "leaveField";
+  if (abilityActionPreventedByAbility(state, playerId, permanent, action, options)) return true;
+  return false;
+}
+
+function abilityProtectionRulesForPermanent(state, permanent) {
+  const rules = baseAbilitiesLost(permanent) ? [] : [...(topDef(state, permanent).abilityProtections ?? [])];
+  for (const modifier of permanent.keywordModifiers ?? []) {
+    if (modifier.keyword !== "abilityProtection") continue;
+    rules.push(modifier.value ?? { actions: ["sideline", "bpReduction"], source: "any" });
+  }
+  return rules;
+}
+
+function abilityActionPreventedByAbility(state, targetPlayerId, permanent, action, context = {}) {
+  const sourcePlayer = context.sourcePlayer;
+  const sourceType = context.sourceKind === "trigger" ? "trigger" : context.sourceDef?.type;
+  return abilityProtectionRulesForPermanent(state, permanent).some((rule) => {
+    if (!(rule.actions ?? []).includes(action) && !(rule.actions ?? []).includes("leaveField")) return false;
+    if (rule.source === "opponent" && (!sourcePlayer || sourcePlayer === targetPlayerId)) return false;
+    if (rule.sourceTypes?.length > 0 && sourceType && !rule.sourceTypes.includes(sourceType)) return false;
+    if (rule.during === "opponentTurn" && state.activePlayer === targetPlayerId) return false;
+    if (rule.during === "controllerTurn" && state.activePlayer !== targetPlayerId) return false;
+    return true;
+  });
 }
 
 function resolveTargetSidelinedWatchers(state, permanent) {
@@ -1447,6 +1960,11 @@ function removePermanentToZone(state, playerId, lineName, index, zoneName, optio
   const choices = options?.choices ?? {};
   const sourcePlayer = options?.sourcePlayer ?? state.activePlayer;
 
+  if (permanentZoneMovePreventedByAbility(state, playerId, current, zoneName, options)) {
+    state.log.push(`${currentDef.name} remained on the field because it is protected from that ability.`);
+    return undefined;
+  }
+
   if (zoneName === "hand"
     && currentDef.returnToHandHandSidelineInstead
     && state.activePlayer === playerId
@@ -1470,6 +1988,38 @@ function removePermanentToZone(state, playerId, lineName, index, zoneName, optio
     }
   }
 
+  if (options?.byAbility
+    && !options?.suppressNamedLeaveReplacement
+    && sourceIsOpponent(sourcePlayer, playerId)) {
+    const candidates = [];
+    for (const candidateLine of [LINES.FRONT, LINES.ENERGY]) {
+      lineOf(player, candidateLine).forEach((permanent, candidateIndex) => {
+        if (permanent.pid === current.pid || baseAbilitiesLost(permanent)) return;
+        const replacement = topDef(state, permanent).opponentAbilityLeaveReplacement;
+        if (!replacement || !cardDefHasName(currentDef, replacement.protectedName)) return;
+        if (replacement.line && replacement.line !== candidateLine) return;
+        if (replacement.requiresActive && permanent.rested) return;
+        if (replacement.during === "controllerTurn" && state.activePlayer !== playerId) return;
+        candidates.push({ lineName: candidateLine, index: candidateIndex, permanent });
+      });
+    }
+    const replacementChoice = choices.namedLeaveReplacement;
+    if (candidates.length > 0 && replacementChoice !== false && replacementChoice !== "decline") {
+      const selected = Number.isInteger(replacementChoice) ? candidates[replacementChoice] : candidates[0];
+      if (selected) {
+        removePermanentToZone(state, playerId, selected.lineName, selected.index, "sideline", {
+          sidelined: true,
+          sourcePlayer: playerId,
+          byAbility: true,
+          suppressNamedLeaveReplacement: true,
+          choices
+        });
+        state.log.push(`${playerId} sidelined ${topDef(state, selected.permanent).name} instead of ${currentDef.name} leaving the field.`);
+        return current;
+      }
+    }
+  }
+
   if (zoneName === "sideline"
     && options?.sidelined
     && lineName === LINES.FRONT
@@ -1481,11 +2031,12 @@ function removePermanentToZone(state, playerId, lineName, index, zoneName, optio
       removePermanentToZone(state, playerId, LINES.ENERGY, replacementIndex, "sideline", {
         sidelined: true,
         sourcePlayer,
+        byAbility: options?.byAbility,
         suppressGoreinuReplacement: true,
         choices
       });
       const moved = removeFromLine(player, lineName, index);
-      insertPermanent(state, playerId, LINES.ENERGY, moved);
+      insertPermanent(state, playerId, LINES.ENERGY, moved, undefined, { operation: "move", choices });
       resolveCharacterMovedOutsideMovementPhase(state, playerId, moved, LINES.FRONT, LINES.ENERGY, { choices });
       state.log.push(`${playerId} sidelined White Goreinu instead and moved ${currentDef.name} to the energy line.`);
       return moved;
@@ -1493,12 +2044,13 @@ function removePermanentToZone(state, playerId, lineName, index, zoneName, optio
   }
 
   if (currentDef.moveToEnergyInsteadOnOpponentAbilityLeave
+    && options?.byAbility
     && lineName === LINES.FRONT
     && zoneName !== LINES.ENERGY
     && sourceIsOpponent(sourcePlayer, playerId)
-    && player.energyLine.length < MAX_LINE_SIZE) {
+    && player.energyLine.length < lineCapacity(state, playerId, LINES.ENERGY)) {
     const moved = removeFromLine(player, lineName, index);
-    insertPermanent(state, playerId, LINES.ENERGY, moved);
+    insertPermanent(state, playerId, LINES.ENERGY, moved, undefined, { operation: "move", choices });
     resolveCharacterMovedOutsideMovementPhase(state, playerId, moved, LINES.FRONT, LINES.ENERGY, { choices });
     state.log.push(`${playerId} moved ${currentDef.name} to the energy line instead of it leaving the field.`);
     return moved;
@@ -1532,24 +2084,127 @@ function removePermanentToZone(state, playerId, lineName, index, zoneName, optio
 function makeRoomOnLine(state, playerId, lineName, replaceIndex) {
   const player = getPlayer(state, playerId);
   const line = lineOf(player, lineName);
-  if (line.length < MAX_LINE_SIZE) return { removed: undefined, removalDelta: 0 };
+  const capacity = lineCapacity(state, playerId, lineName);
+  if (line.length < capacity) return { removed: undefined, removalDelta: 0 };
 
-  assertRule(Number.isInteger(replaceIndex), "LINE_FULL", "A full line requires a replacement index.", {
-    lineName
+  const selectedIndex = replaceIndex === undefined ? undefined : overflowChoiceIndex(line, replaceIndex);
+  assertRule(Number.isInteger(selectedIndex), "LINE_FULL", "A full line requires a replacement index.", {
+    playerId,
+    lineName,
+    capacity
+  });
+  assertRule(line.length > 0, "LINE_FULL", "No cards can be placed on this line while its capacity is zero.", {
+    playerId,
+    lineName,
+    capacity
   });
   const removalBefore = totalRemovalCount(state);
-  const removed = removePermanentToZone(state, playerId, lineName, replaceIndex, "removal", { sidelined: false });
+  assertRule(selectedIndex >= 0 && selectedIndex < line.length, "LINE_FULL", "The chosen line replacement does not exist.", {
+    playerId,
+    lineName,
+    selectedIndex
+  });
+  const removed = removePermanentToZone(state, playerId, lineName, selectedIndex, "removal", { sidelined: false });
   return { removed, removalDelta: totalRemovalCount(state) - removalBefore };
 }
 
-function insertPermanent(state, playerId, lineName, permanent, replaceIndex) {
-  assertRule(lineName !== LINES.FRONT || !topDef(state, permanent).cannotEnterFrontLine, "LINE_RESTRICTION", "This card cannot be placed on the front line.", {
-    card: topDef(state, permanent).id
+function lineCapacity(state, playerId, lineName) {
+  const player = getPlayer(state, playerId);
+  let capacity = MAX_LINE_SIZE;
+  for (const source of [...player.frontLine, ...player.energyLine]) {
+    if (baseAbilitiesLost(source)) continue;
+    for (const modifier of topDef(state, source).lineCapacityModifiers ?? []) {
+      if (modifier.line !== lineName || !staticModifierApplies(state, source, modifier)) continue;
+      capacity += Number(modifier.amount ?? 0);
+    }
+  }
+  return Math.max(0, capacity);
+}
+
+function maximumHandSize(state, playerId) {
+  const player = getPlayer(state, playerId);
+  let maximum = MAX_HAND_AT_END;
+  for (const source of [...player.frontLine, ...player.energyLine]) {
+    if (baseAbilitiesLost(source)) continue;
+    maximum = Math.max(maximum, Number(topDef(state, source).maximumHandSize ?? maximum));
+  }
+  return maximum;
+}
+
+function hasFreeExtraDraw(state, playerId) {
+  return getPlayer(state, playerId).frontLine.some((permanent) => (
+    !baseAbilitiesLost(permanent) && topDef(state, permanent).freeExtraDrawFromFrontLine
+  ));
+}
+
+function cardCanEnterLine(state, playerId, cardDef, lineName, options = {}) {
+  const operation = options.operation ?? "place";
+  if (operation === "play" && cardDef.raidOnlyPlay) return false;
+  if (lineName === LINES.FRONT) {
+    if (cardDef.frontLineEntryCondition
+      && !conditionMet(state, playerId, cardDef.frontLineEntryCondition, { permanent: options.permanent })) return false;
+    if (cardDef.cannotEnterFrontLine) return false;
+    if (operation === "play" && cardDef.cannotPlayToFrontLine) return false;
+    if ((operation === "move" || operation === "movementPhase") && cardDef.frontLineMoveByOwnAbilityOnly
+      && options.sourcePermanent?.pid !== options.permanent?.pid) return false;
+  }
+  if (lineName === LINES.ENERGY) {
+    if (cardDef.cannotEnterEnergyLine) return false;
+    if (operation === "play" && cardDef.cannotPlayToEnergyLine) return false;
+  }
+  if (operation === "movementPhase" && cardDef.cannotMoveDuringMovementPhase) return false;
+  return true;
+}
+
+function permanentCanEnterLine(state, playerId, permanent, lineName, options = {}) {
+  return cardCanEnterLine(state, playerId, topDef(state, permanent), lineName, { ...options, permanent });
+}
+
+function overflowChoiceIndex(line, rawChoice) {
+  if (Number.isInteger(rawChoice)) return rawChoice;
+  const permanentId = rawChoice?.permanentId ?? rawChoice?.pid;
+  return permanentId ? line.findIndex((permanent) => permanent.pid === permanentId) : 0;
+}
+
+function enforceLineCapacity(state, playerId, lineName, options = {}) {
+  const player = getPlayer(state, playerId);
+  const line = lineOf(player, lineName);
+  const choices = options.choices?.[options.overflowChoiceKey ?? "lineOverflowChoices"] ?? [];
+  let removalDelta = 0;
+  let choiceIndex = 0;
+  while (line.length > lineCapacity(state, playerId, lineName)) {
+    const selected = overflowChoiceIndex(line, Array.isArray(choices) ? choices[choiceIndex] : choices);
+    assertRule(selected >= 0 && selected < line.length, "LINE_OVERFLOW", "Line overflow choice is out of range.", {
+      playerId,
+      lineName,
+      selected
+    });
+    const removalBefore = totalRemovalCount(state);
+    removePermanentToZone(state, playerId, lineName, selected, "removal", {
+      sidelined: false,
+      sourcePlayer: undefined,
+      stateBased: true
+    });
+    removalDelta += totalRemovalCount(state) - removalBefore;
+    choiceIndex += 1;
+  }
+  return removalDelta;
+}
+
+function insertPermanent(state, playerId, lineName, permanent, replaceIndex, options = {}) {
+  assertRule(permanentCanEnterLine(state, playerId, permanent, lineName, options), "LINE_RESTRICTION", "This card cannot enter that line this way.", {
+    card: topDef(state, permanent).id,
+    lineName,
+    operation: options.operation
   });
   const player = getPlayer(state, playerId);
   const roomResult = makeRoomOnLine(state, playerId, lineName, replaceIndex);
   lineOf(player, lineName).push(permanent);
-  return roomResult;
+  const overflowRemovalDelta = enforceLineCapacity(state, playerId, lineName, options);
+  return {
+    ...roomResult,
+    removalDelta: (roomResult.removalDelta ?? 0) + overflowRemovalDelta
+  };
 }
 
 function findPermanentById(state, playerId, permanentId) {
@@ -1574,16 +2229,235 @@ function zoneCardMatches(state, cardRef, filter = {}) {
   return cardDefMatchesFilter(defOf(state, cardRef), filter);
 }
 
-function playCardFromZone(state, playerId, effect, context = {}) {
+function destinationLineForEffect(effect, context = {}, ordinal = 0) {
+  const allowed = effect.destinationLines?.length
+    ? effect.destinationLines
+    : [effect.destinationLine ?? LINES.FRONT];
+  const rawChoice = context.choices?.[effect.destinationLineChoiceKey ?? "destinationLine"];
+  const requested = Array.isArray(rawChoice) ? rawChoice[ordinal] : rawChoice;
+  const destinationLine = requested ?? allowed[0];
+  assertRule(allowed.includes(destinationLine), "LINE", "Chosen play destination is not allowed by this effect.", {
+    destinationLine,
+    allowed
+  });
+  return destinationLine;
+}
+
+function playCardsFromZoneSimultaneously(state, playerId, effect, context = {}) {
   const sourcePlayerId = effect.player === "opponent" ? opponentOf(playerId) : effect.player ?? playerId;
   const player = getPlayer(state, sourcePlayerId);
   const zones = effect.zones ?? [effect.zone ?? "hand"];
   const count = effect.count ?? effect.amount ?? effect.max ?? 1;
   const choiceKey = effect.choiceKey ?? `${zones[0]}Index`;
   const chosen = context.choices?.[choiceKey];
+  if (Array.isArray(chosen)) {
+    assertRule(chosen.length <= count, "ZONE_SELECTION", "Too many cards selected for simultaneous play.", {
+      selected: chosen.length,
+      count
+    });
+    if (chosen.length === 0) return;
+  }
 
-  for (let played = 0; played < count; played += 1) {
-    const selected = Array.isArray(chosen) ? chosen[played] : played === 0 ? chosen : undefined;
+  const selected = [];
+  const selectedUids = new Set();
+  const requestedCount = Array.isArray(chosen) ? chosen.length : count;
+  for (let played = 0; played < requestedCount; played += 1) {
+    const requested = Array.isArray(chosen) ? chosen[played] : played === 0 ? chosen : undefined;
+    let found;
+    if (requested && typeof requested === "object") {
+      found = findZoneCard(state, player, zones, effect.filter, requested, (card) => {
+        return zoneCardMatchesPlayFilter(state, sourcePlayerId, card, effect.filter ?? {});
+      });
+    } else if (Number.isInteger(requested)) {
+      const zoneName = zones[0];
+      found = { zoneName, zone: zoneOf(player, zoneName), index: requested };
+    } else {
+      for (const zoneName of zones) {
+        const zone = zoneOf(player, zoneName);
+        const index = zone.findIndex((card) => !selectedUids.has(card.uid)
+          && zoneCardMatchesPlayFilter(state, sourcePlayerId, card, effect.filter ?? {}));
+        if (index !== -1) {
+          found = { zoneName, zone, index };
+          break;
+        }
+      }
+    }
+    if (!found || !found.zone[found.index]) {
+      if (requested !== undefined) assertRule(false, "ZONE_SELECTION", "Chosen simultaneous-play card does not exist.", { requested });
+      break;
+    }
+    const cardRef = found.zone[found.index];
+    assertRule(!selectedUids.has(cardRef.uid), "ZONE_SELECTION", "The same card cannot be selected twice.", { card: cardRef.uid });
+    assertRule(zoneCardMatchesPlayFilter(state, sourcePlayerId, cardRef, effect.filter ?? {}), "ZONE_SELECTION", "Chosen card does not match effect filter.", {
+      zone: found.zoneName,
+      index: found.index,
+      filter: effect.filter
+    });
+    selected.push({ ...found, cardRef });
+    selectedUids.add(cardRef.uid);
+  }
+  if (selected.length === 0) return;
+
+  const destinationLines = selected.map((_, index) => destinationLineForEffect(effect, context, index));
+  selected.forEach(({ cardRef }, index) => {
+    const destinationLine = destinationLines[index];
+    assertRule(cardCanEnterLine(state, sourcePlayerId, defOf(state, cardRef), destinationLine, { operation: "play" }), "LINE_RESTRICTION", "A selected card cannot be played to that line.", {
+      card: cardRef.defId,
+      destinationLine
+    });
+  });
+
+  const rawReplacements = context.choices?.[effect.replaceChoiceKey ?? "replaceIndices"]
+    ?? context.choices?.replaceIndices
+    ?? context.choices?.replaceIndex;
+  const pendingByLine = new Map();
+  destinationLines.forEach((destinationLine, ordinal) => {
+    const destination = lineOf(player, destinationLine);
+    const pending = Number(pendingByLine.get(destinationLine) ?? 0) + 1;
+    pendingByLine.set(destinationLine, pending);
+    if (destination.length + pending <= lineCapacity(state, sourcePlayerId, destinationLine)) return;
+    assertRule(destination.length > 0, "LINE_FULL", "The destination line cannot make enough room for simultaneous play.");
+    const rawChoice = Array.isArray(rawReplacements) ? rawReplacements[ordinal] : rawReplacements;
+    const replaceIndex = rawChoice === undefined ? 0 : overflowChoiceIndex(destination, rawChoice);
+    assertRule(replaceIndex >= 0 && replaceIndex < destination.length, "LINE_FULL", "Simultaneous-play replacement index is out of range.", {
+      replaceIndex
+    });
+    removePermanentToZone(state, sourcePlayerId, destinationLine, replaceIndex, "removal", {
+      sidelined: false,
+      sourcePlayer: sourcePlayerId,
+      stateBased: true
+    });
+  });
+
+  const selectedByZone = new Map();
+  for (const item of selected) {
+    if (!selectedByZone.has(item.zoneName)) selectedByZone.set(item.zoneName, []);
+    selectedByZone.get(item.zoneName).push(item);
+  }
+  for (const items of selectedByZone.values()) {
+    items.sort((left, right) => right.index - left.index);
+    for (const item of items) item.zone.splice(item.index, 1);
+  }
+
+  const permanents = selected.map(({ cardRef }) => createPermanent(state, sourcePlayerId, cardRef, effect.rested ?? true));
+  permanents.forEach((permanent, index) => {
+    lineOf(player, destinationLines[index]).push(permanent);
+    rememberPlayedPermanent(context, permanent, sourcePlayerId);
+    flagCharacterPlayed(state, sourcePlayerId, topDef(state, permanent));
+  });
+  for (const destinationLine of new Set(destinationLines)) {
+    enforceLineCapacity(state, sourcePlayerId, destinationLine, { choices: context.choices });
+  }
+  context.lastEffectPlayedCount = permanents.length;
+
+  if (context.suppressPlayedAbilities || effect.suppressPlayedAbilities) return;
+  const requestedOrder = context.choices?.[effect.abilityOrderChoiceKey ?? "simultaneousPlayedOrder"]
+    ?? permanents.map((_, index) => index);
+  assertRule(Array.isArray(requestedOrder) && requestedOrder.length === permanents.length, "EFFECT_CHOICE", "Simultaneous played-ability order must include every played card.", {
+    requestedOrder,
+    count: permanents.length
+  });
+  assertRule(new Set(requestedOrder).size === permanents.length, "EFFECT_CHOICE", "Simultaneous played-ability order cannot repeat a card.");
+  for (const index of requestedOrder) {
+    const permanent = permanents[index];
+    assertRule(permanent, "EFFECT_CHOICE", "Simultaneous played-ability order index is out of range.", { index });
+    resolvePermanentAbilities(state, sourcePlayerId, permanent, TIMINGS.WHEN_PLAYED, {
+      permanent,
+      choices: context.choices,
+      playedByAbility: true
+    });
+  }
+}
+
+function resolveOpponentHandPlayChoice(state, playerId, effect, context, zones, count, choiceKey) {
+  if (effect.player !== "opponent" || zones.length !== 1 || zones[0] !== "hand") return;
+  const sourcePlayerId = opponentOf(playerId);
+  const hand = getPlayer(state, sourcePlayerId).hand;
+  const matchingIndices = hand
+    .map((card, index) => ({ card, index }))
+    .filter(({ card }) => zoneCardMatchesPlayFilter(state, sourcePlayerId, card, effect.filter ?? {}))
+    .map(({ index }) => index);
+  const maximum = Math.min(count, matchingIndices.length);
+  const minimum = Math.min(maximum, Math.max(0, Number(effect.min ?? count)));
+  resolveRuntimeChoices(state, sourcePlayerId, effect, context, {
+    kind: "opponentMayPlayCardFromHand",
+    initiatingPlayerId: playerId,
+    cards: hand,
+    ownerId: sourcePlayerId,
+    matchingIndices,
+    min: minimum,
+    max: maximum,
+    choiceKey,
+    destinationLine: effect.destinationLine ?? effect.destinationLines?.[0] ?? LINES.FRONT,
+    destinationLines: effect.destinationLines,
+    destinationLineChoiceKey: effect.destinationLineChoiceKey ?? "destinationLine"
+  });
+}
+
+function playCardFromZone(state, playerId, effect, context = {}) {
+  context.lastEffectPlayedCount = 0;
+  const zones = effect.zones ?? [effect.zone ?? "hand"];
+  const count = effect.count ?? effect.amount ?? effect.max ?? 1;
+  const choiceKey = effect.choiceKey ?? `${zones[0]}Index`;
+  resolveOpponentHandPlayChoice(state, playerId, effect, context, zones, count, choiceKey);
+  if (effect.simultaneous) {
+    playCardsFromZoneSimultaneously(state, playerId, effect, context);
+    return;
+  }
+  const sourcePlayerId = effect.player === "opponent" ? opponentOf(playerId) : effect.player ?? playerId;
+  const player = getPlayer(state, sourcePlayerId);
+  const availableCount = zones.reduce((total, zoneName) => total + zoneOf(player, zoneName)
+    .filter((card) => zoneCardMatchesPlayFilter(state, sourcePlayerId, card, effect.filter ?? {})).length, 0);
+  const minimum = Math.min(availableCount, Math.max(0, Number(effect.min ?? count)));
+  let chosen = context.choices?.[choiceKey];
+  const destinationChoiceKey = effect.destinationLineChoiceKey ?? "destinationLine";
+  const replaceChoiceKey = effect.replaceChoiceKey ?? "replaceIndex";
+  const destinationChoiceMissing = Boolean(effect.destinationLines?.length)
+    && context.choices?.[destinationChoiceKey] === undefined;
+  const replacementChoiceMissing = context.choices?.[replaceChoiceKey] === undefined
+    && (effect.destinationLines ?? [effect.destinationLine ?? LINES.FRONT]).some((lineName) => (
+      lineOf(player, lineName).length >= lineCapacity(state, sourcePlayerId, lineName)
+    ));
+  if (chosen === undefined || destinationChoiceMissing || replacementChoiceMissing) {
+    resolveRuntimeChoices(state, playerId, effect, context, {
+      kind: "playCardFromZone",
+      ownerId: sourcePlayerId,
+      zones,
+      count,
+      minimum,
+      choiceKey,
+      destinationChoiceKey,
+      replaceChoiceKey
+    });
+    chosen = context.choices?.[choiceKey];
+  }
+  if (chosen === undefined && effect.player === "opponent" && zones.length === 1 && zones[0] === "hand" && minimum === 0) {
+    chosen = [];
+  }
+  if (Array.isArray(chosen)) {
+    assertRule(chosen.length >= minimum && chosen.length <= count, "ZONE_SELECTION", "A legal number of cards must be selected to play.", {
+      selected: chosen.length,
+      minimum,
+      count
+    });
+    if (chosen.length === 0) return;
+  }
+  const plannedSelections = Array.isArray(chosen)
+    ? chosen.map((selection) => {
+      if (selection?.uid) return selection;
+      const zoneName = selection && typeof selection === "object"
+        ? selection.zone ?? selection.zoneName ?? zones[0]
+        : zones[0];
+      const index = selection && typeof selection === "object" ? selection.index : selection;
+      const card = Number.isInteger(index) ? zoneOf(player, zoneName)[index] : undefined;
+      return card ? { zone: zoneName, uid: card.uid } : selection;
+    })
+    : undefined;
+  const replaceChoices = context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"];
+  const requestedCount = plannedSelections ? plannedSelections.length : count;
+
+  for (let played = 0; played < requestedCount; played += 1) {
+    const selected = plannedSelections ? plannedSelections[played] : played === 0 ? chosen : undefined;
     const found = findZoneCard(state, player, zones, effect.filter, selected, (card) => {
       return zoneCardMatchesPlayFilter(state, sourcePlayerId, card, effect.filter ?? {});
     });
@@ -1600,13 +2474,23 @@ function playCardFromZone(state, playerId, effect, context = {}) {
       chosenIndex: index,
       filter: effect.filter
     });
+    const destinationLine = destinationLineForEffect(effect, context, played);
+    assertRule(cardCanEnterLine(state, sourcePlayerId, defOf(state, cardRef), destinationLine, { operation: "play" }), "LINE_RESTRICTION", "The chosen card cannot be played to that line.", {
+      card: cardRef.defId,
+      destinationLine
+    });
     zone.splice(index, 1);
     const permanent = createPermanent(state, sourcePlayerId, cardRef, effect.rested ?? true);
-    insertPermanent(state, sourcePlayerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+    insertPermanent(state, sourcePlayerId, destinationLine, permanent, Array.isArray(replaceChoices) ? replaceChoices[played] : replaceChoices, {
+      operation: "play",
+      choices: context.choices
+    });
     rememberPlayedPermanent(context, permanent, sourcePlayerId);
+    flagCharacterPlayed(state, sourcePlayerId, topDef(state, permanent));
     if (!context.suppressPlayedAbilities && !effect.suppressPlayedAbilities) {
       resolvePermanentAbilities(state, sourcePlayerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
     }
+    context.lastEffectPlayedCount += 1;
   }
 }
 
@@ -1616,65 +2500,219 @@ function zoneCardMatchesPlayFilter(state, playerId, cardRef, filter = {}) {
   return true;
 }
 
-function defaultRaidTargetForCard(state, playerId, cardDef) {
-  if (!cardDef.raid) return undefined;
+function defaultRaidTargetForCard(state, playerId, cardDef, options = {}) {
+  return raidTargetsForCard(state, playerId, cardDef, options)[0];
+}
+
+function raidTargetsForCard(state, playerId, cardDef, options = {}) {
+  if (!cardDef?.raid) return [];
+  if (!raidUseConditionMet(state, playerId, cardDef, options)) return [];
   const player = getPlayer(state, playerId);
+  const targets = [];
   for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
     const line = lineOf(player, lineName);
-    const index = line.findIndex((permanent) => {
-      return isCharacter(state, permanent)
-        && !topDef(state, permanent).raid
-        && matchesRaidRequirement(state, cardDef.raid, permanent);
+    line.forEach((permanent, index) => {
+      if (!isCharacter(state, permanent)
+        || permanent.pid === options.excludePermanentId
+        || topDef(state, permanent).raid
+        || !matchesRaidRequirement(state, cardDef.raid, permanent, {
+          raidCardDef: cardDef,
+          sourceKind: options.sourceKind
+        })) return;
+      targets.push({ lineName, index });
     });
-    if (index !== -1) return { lineName, index };
   }
-  return undefined;
+  return targets;
 }
 
 function playOrRaidCardFromZone(state, playerId, effect, context = {}) {
+  context.lastEffectPlayedCount = 0;
   const player = getPlayer(state, playerId);
   const zones = effect.zones ?? [effect.zone ?? "hand"];
+  const count = effect.count ?? effect.amount ?? effect.max ?? 1;
   const choiceKey = effect.choiceKey ?? `${zones[0]}Index`;
-  const selected = context.choices?.[choiceKey];
-  let found;
+  const selectedChoices = context.choices?.[choiceKey];
+  if (Array.isArray(selectedChoices)) {
+    assertRule(selectedChoices.length <= count, "ZONE_SELECTION", "Too many cards selected to play or Raid.", {
+      selected: selectedChoices.length,
+      count
+    });
+    if (selectedChoices.length === 0) return;
+  }
 
-  for (const zoneName of zones) {
-    const zone = zoneOf(player, zoneName);
-    const index = Number.isInteger(selected) && zones.length === 1
-      ? selected
-      : zone.findIndex((card) => zoneCardMatchesPlayFilter(state, playerId, card, effect.filter ?? {}));
-    if (index !== -1 && zone[index] && zoneCardMatchesPlayFilter(state, playerId, zone[index], effect.filter ?? {})) {
-      found = { zoneName, zone, index };
-      break;
+  // Preserve selected identities while earlier cards are removed from their zones.
+  const plannedSelections = Array.isArray(selectedChoices)
+    ? selectedChoices.map((selection) => {
+      if (selection?.uid) return selection;
+      const zoneName = selection && typeof selection === "object"
+        ? selection.zone ?? selection.zoneName ?? zones[0]
+        : zones[0];
+      const index = selection && typeof selection === "object" ? selection.index : selection;
+      const card = Number.isInteger(index) ? zoneOf(player, zoneName)[index] : undefined;
+      return card ? { uid: card.uid } : selection;
+    })
+    : undefined;
+  const raidChoices = context.choices?.[effect.raidChoiceKey ?? "performRaid"];
+  const raidTargets = context.choices?.[effect.raidTargetChoiceKey ?? "raidTarget"];
+  const replaceChoices = context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"];
+  const raidMoveChoices = context.choices?.[effect.raidMoveChoiceKey ?? "moveRaidToFront"];
+  const raidMoveReplaceChoices = context.choices?.[effect.raidMoveReplaceChoiceKey ?? "raidMoveReplaceIndex"];
+  const requestedCount = plannedSelections ? plannedSelections.length : count;
+  const deferred = requestedCount > 1 || effect.simultaneous ? [] : undefined;
+
+  for (let index = 0; index < requestedCount; index += 1) {
+    const resolved = playOrRaidSingleCardFromZone(state, playerId, effect, context, {
+      selected: plannedSelections ? plannedSelections[index] : index === 0 ? selectedChoices : undefined,
+      raidChoice: Array.isArray(raidChoices) ? raidChoices[index] : raidChoices,
+      raidTarget: Array.isArray(raidTargets) ? raidTargets[index] : raidTargets,
+      replaceIndex: Array.isArray(replaceChoices) ? replaceChoices[index] : replaceChoices,
+      moveToFront: Array.isArray(raidMoveChoices) ? raidMoveChoices[index] : raidMoveChoices,
+      moveReplaceIndex: Array.isArray(raidMoveReplaceChoices) ? raidMoveReplaceChoices[index] : raidMoveReplaceChoices,
+      destinationLine: destinationLineForEffect(effect, context, index),
+      deferred
+    });
+    if (!resolved) break;
+    context.lastEffectPlayedCount += 1;
+  }
+
+  if (deferred?.length) {
+    const requestedOrder = context.choices?.[effect.abilityOrderChoiceKey ?? "simultaneousPlayedOrder"]
+      ?? deferred.map((_, index) => index);
+    assertRule(Array.isArray(requestedOrder) && requestedOrder.length === deferred.length, "EFFECT_CHOICE", "Simultaneous play-or-Raid ability order must include every played card.", {
+      requestedOrder,
+      count: deferred.length
+    });
+    assertRule(new Set(requestedOrder).size === deferred.length, "EFFECT_CHOICE", "Simultaneous play-or-Raid ability order cannot repeat a card.");
+    for (const index of requestedOrder) {
+      const entry = deferred[index];
+      assertRule(entry, "EFFECT_CHOICE", "Simultaneous play-or-Raid ability order index is out of range.", { index });
+      if (!context.suppressPlayedAbilities && !effect.suppressPlayedAbilities) {
+        resolvePermanentAbilities(state, playerId, entry.permanent, TIMINGS.WHEN_PLAYED, {
+          permanent: entry.permanent,
+          raid: entry.raid,
+          choices: context.choices,
+          playedByAbility: true
+        });
+      }
+      if (entry.raid) {
+        resolveRaidedAbilities(state, playerId, entry.permanent, entry.raidedDef, {
+          permanent: entry.permanent,
+          raid: true,
+          choices: context.choices
+        });
+      }
     }
   }
-  if (!found) return;
+}
+
+function playOrRaidSingleCardFromZone(state, playerId, effect, context, options = {}) {
+  const player = getPlayer(state, playerId);
+  const zones = effect.zones ?? [effect.zone ?? "hand"];
+  const selected = options.selected;
+  let found;
+
+  if (selected?.uid) {
+    for (const zoneName of zones) {
+      const zone = zoneOf(player, zoneName);
+      const index = zone.findIndex((card) => card.uid === selected.uid);
+      if (index !== -1) {
+        found = { zoneName, zone, index };
+        break;
+      }
+    }
+  } else {
+    found = findZoneCard(state, player, zones, effect.filter, selected, (card) => {
+      return zoneCardMatchesPlayFilter(state, playerId, card, effect.filter ?? {});
+    });
+  }
+  if (!found || !found.zone[found.index]) return false;
 
   const cardRef = found.zone[found.index];
+  assertRule(zoneCardMatchesPlayFilter(state, playerId, cardRef, effect.filter ?? {}), "ZONE_SELECTION", "Chosen card does not match the play-or-Raid filter.", {
+    zone: found.zoneName,
+    index: found.index,
+    filter: effect.filter
+  });
   const cardDef = defOf(state, cardRef);
-  const raidChoice = context.choices?.[effect.raidChoiceKey ?? "performRaid"];
-  const raidTarget = context.choices?.[effect.raidTargetChoiceKey ?? "raidTarget"] ?? defaultRaidTargetForCard(state, playerId, cardDef);
-  const shouldRaid = effect.allowRaid && cardDef.raid && raidTarget && raidChoice !== false;
+  const raidChoice = options.raidChoice;
+  const excludedRaidTarget = effect.raidTargetOtherThanSource ? context.permanent?.pid : undefined;
+  const raidTarget = options.raidTarget ?? defaultRaidTargetForCard(state, playerId, cardDef, {
+    excludePermanentId: excludedRaidTarget,
+    sourceKind: context.sourceKind
+  });
+  const shouldRaid = effect.allowRaid && cardDef.raid && raidTarget && raidChoice !== false
+    && raidUseConditionMet(state, playerId, cardDef, { sourceKind: context.sourceKind });
+
+  if (!shouldRaid) {
+    if (effect.forceRaid) return false;
+    if (effect.nonRaidDestination) {
+      found.zone.splice(found.index, 1);
+      placeCardInZone(state, player, effect.nonRaidDestination, cardRef);
+      context.lastMovedCards = [cardRef];
+      context.lastMovedCardCount = (context.lastMovedCardCount ?? 0) + 1;
+      return true;
+    }
+    const destinationLine = options.destinationLine ?? destinationLineForEffect(effect, context);
+    const canEnterLine = cardCanEnterLine(state, playerId, cardDef, destinationLine, { operation: "play" });
+    if (!canEnterLine && effect.keepInZoneIfCannotPlay) return false;
+    assertRule(canEnterLine, "LINE_RESTRICTION", "The chosen card cannot be played without performing Raid.", {
+      card: cardDef.id,
+      destinationLine
+    });
+  }
 
   found.zone.splice(found.index, 1);
   if (shouldRaid) {
     const lineName = raidTarget.lineName ?? raidTarget.line ?? LINES.FRONT;
     const target = lineOf(player, lineName)[raidTarget.index];
     assertRule(target, "RAID_TARGET", "Raid target does not exist.");
-    assertRule(matchesRaidRequirement(state, cardDef.raid, target), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
+    assertRule(target.pid !== excludedRaidTarget, "RAID_TARGET", "This ability cannot perform Raid on its source character.");
+    assertRule(matchesRaidRequirement(state, cardDef.raid, target, { raidCardDef: cardDef, sourceKind: context.sourceKind }), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
     const raidedDef = topDef(state, target);
+    resetPermanentForRaid(target);
     target.cards.push(cardRef);
     readyPermanent(target);
+    const location = findPermanentLocation(player, target.pid);
+    const moveToFront = options.moveToFront
+      ?? effect.moveRaidToFrontDefault
+      ?? (location?.lineName === LINES.ENERGY
+        && player.frontLine.length < lineCapacity(state, playerId, LINES.FRONT));
+    if (location?.lineName === LINES.ENERGY && moveToFront) {
+      assertRule(permanentCanEnterLine(state, playerId, target, LINES.FRONT, { operation: "move" }), "LINE_RESTRICTION", "This raided character cannot move to the front line.");
+      const moved = removeFromLine(player, LINES.ENERGY, location.index);
+      insertPermanent(state, playerId, LINES.FRONT, moved, options.moveReplaceIndex, {
+        operation: "move",
+        sourcePermanent: moved,
+        choices: context.choices
+      });
+      resolveCharacterMovedOutsideMovementPhase(state, playerId, moved, LINES.ENERGY, LINES.FRONT, context);
+    }
     rememberPlayedPermanent(context, target, playerId);
-    resolvePermanentAbilities(state, playerId, target, TIMINGS.WHEN_PLAYED, { permanent: target, raid: true, choices: context.choices, playedByAbility: true });
-    resolveRaidedAbilities(state, playerId, target, raidedDef, { permanent: target, raid: true, choices: context.choices });
-    return;
+    flagCharacterPlayed(state, playerId, cardDef);
+    if (options.deferred) {
+      options.deferred.push({ permanent: target, raid: true, raidedDef });
+    } else {
+      if (!context.suppressPlayedAbilities && !effect.suppressPlayedAbilities) {
+        resolvePermanentAbilities(state, playerId, target, TIMINGS.WHEN_PLAYED, { permanent: target, raid: true, choices: context.choices, playedByAbility: true });
+      }
+      resolveRaidedAbilities(state, playerId, target, raidedDef, { permanent: target, raid: true, choices: context.choices });
+    }
+    return true;
   }
 
   const permanent = createPermanent(state, playerId, cardRef, effect.rested ?? true);
-  insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+  insertPermanent(state, playerId, options.destinationLine ?? destinationLineForEffect(effect, context), permanent, options.replaceIndex, {
+    operation: "play",
+    choices: context.choices
+  });
   rememberPlayedPermanent(context, permanent, playerId);
-  resolvePermanentAbilities(state, playerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
+  flagCharacterPlayed(state, playerId, cardDef);
+  if (options.deferred) {
+    options.deferred.push({ permanent, raid: false });
+  } else if (!context.suppressPlayedAbilities && !effect.suppressPlayedAbilities) {
+    resolvePermanentAbilities(state, playerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
+  }
+  return true;
 }
 
 function playCardFromZoneMatchingTargetName(state, playerId, effect, context = {}) {
@@ -1694,17 +2732,30 @@ function playSomeNamedFromSidelineAddRest(state, playerId, effect, context = {})
   const player = getPlayer(state, playerId);
   const chosen = [];
   for (const name of effect.names ?? []) {
-    const index = player.sideline.findIndex((card) => sameText(defOf(state, card).name, name));
+    const index = player.sideline.findIndex((card) => cardDefHasName(defOf(state, card), name));
     if (index !== -1) chosen.push(player.sideline.splice(index, 1)[0]);
   }
 
   const playCount = Math.min(effect.playCount ?? 0, chosen.length);
-  const playIndices = context.choices?.[effect.choiceKey ?? "playNamedIndices"] ?? [...Array(playCount).keys()];
-  const playSet = new Set(playIndices.slice(0, playCount));
+  const playChoices = context.choices?.[effect.choiceKey ?? "playNamedIndices"] ?? [...Array(playCount).keys()];
+  assertRule(Array.isArray(playChoices) && playChoices.length === playCount, "ZONE_SELECTION", "Named sideline play requires the correct number of cards.", {
+    selected: playChoices?.length,
+    playCount
+  });
+  const playUids = new Set(playChoices
+    .filter((choice) => choice && typeof choice === "object" && choice.uid)
+    .map((choice) => choice.uid));
+  const playSet = new Set(playChoices.filter((choice) => Number.isInteger(choice)));
+  const replaceChoices = context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"];
+  let playedOrdinal = 0;
   chosen.forEach((card, index) => {
-    if (playSet.has(index)) {
+    if (playSet.has(index) || playUids.has(card.uid)) {
       const permanent = createPermanent(state, playerId, card, effect.rested ?? true);
-      insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+      insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, Array.isArray(replaceChoices) ? replaceChoices[playedOrdinal] : replaceChoices, {
+        operation: "play",
+        choices: context.choices
+      });
+      playedOrdinal += 1;
       rememberPlayedPermanent(context, permanent, playerId);
       resolvePermanentAbilities(state, playerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
     } else {
@@ -1715,9 +2766,15 @@ function playSomeNamedFromSidelineAddRest(state, playerId, effect, context = {})
 
 function findZoneCard(state, player, zoneNames, filter, selected, matcher = (card) => zoneCardMatches(state, card, filter)) {
   if (selected && typeof selected === "object") {
-    const zoneName = selected.zone ?? selected.zoneName ?? zoneNames[0];
-    const zone = zoneOf(player, zoneName);
-    return { zoneName, zone, index: selected.index };
+    const selectedZone = selected.zone ?? selected.zoneName;
+    const candidateZones = selectedZone ? [selectedZone] : zoneNames;
+    for (const zoneName of candidateZones) {
+      const zone = zoneOf(player, zoneName);
+      const index = selected.uid ? zone.findIndex((card) => card.uid === selected.uid) : selected.index;
+      if (index !== -1 && index !== undefined) return { zoneName, zone, index };
+    }
+    const zoneName = selectedZone ?? zoneNames[0];
+    return { zoneName, zone: zoneOf(player, zoneName), index: -1 };
   }
 
   if (Number.isInteger(selected)) {
@@ -1756,9 +2813,34 @@ function playSourceFromZone(state, playerId, effect, context = {}) {
   const found = findSourceCardInZone(state, playerId, context, effect.source ?? "sideline");
   if (!found) return;
 
+  const cardDef = defOf(state, found.card);
+  if (effect.requiredEnergyFulfilled
+    && !hasRequiredEnergy(state, playerId, cardDef, { sourceZone: found.zoneName })) return;
+  const destinationChoiceKey = effect.destinationLineChoiceKey ?? "destinationLine";
+  if (effect.destinationLines?.length && context.choices?.[destinationChoiceKey] === undefined) {
+    resolveRuntimeChoices(state, playerId, effect, context, {
+      kind: "playSourceFromZone",
+      cards: [found.card],
+      sourceName: found.zoneName,
+      destinationLines: effect.destinationLines,
+      destinationLineChoiceKey: destinationChoiceKey,
+      replaceChoiceKey: effect.replaceChoiceKey ?? "replaceIndex"
+    });
+  }
+  const destinationLine = destinationLineForEffect(effect, context);
+  assertRule(cardCanEnterLine(state, playerId, cardDef, destinationLine, { operation: "play" }), "LINE_RESTRICTION", "The source card cannot be played to the chosen line.", {
+    card: cardDef.id,
+    destinationLine
+  });
+
   const cardRef = found.zone.splice(found.index, 1)[0];
-  const permanent = createPermanent(state, playerId, cardRef, effect.rested ?? true);
-  insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+  const entersActive = effect.activeIfTriggerSourceName
+    && cardDefHasName(context.triggerSourceDef, effect.activeIfTriggerSourceName);
+  const permanent = createPermanent(state, playerId, cardRef, entersActive ? false : effect.rested ?? true);
+  insertPermanent(state, playerId, destinationLine, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"], {
+    operation: "play",
+    choices: context.choices
+  });
   rememberPlayedPermanent(context, permanent, playerId);
   if (!context.suppressPlayedAbilities && !effect.suppressPlayedAbilities) {
     resolvePermanentAbilities(state, playerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
@@ -1773,6 +2855,7 @@ function raidSourceFromZone(state, playerId, effect, context = {}) {
   const cardDef = defOf(state, cardRef);
   if (cardDef.type !== CARD_TYPES.CHARACTER || !cardDef.raid) return;
   if (!hasRequiredEnergy(state, playerId, cardDef, { sourceZone: effect.source ?? "sideline", performingRaid: true })) return;
+  if (!raidUseConditionMet(state, playerId, cardDef, { sourceKind: context.sourceKind })) return;
 
   const player = getPlayer(state, playerId);
   const candidates = [];
@@ -1780,11 +2863,23 @@ function raidSourceFromZone(state, playerId, effect, context = {}) {
     lineOf(player, lineName).forEach((permanent, index) => {
       if (!isCharacter(state, permanent)) return;
       if (topDef(state, permanent).raid) return;
-      if (!matchesRaidRequirement(state, cardDef.raid, permanent)) return;
+      if (!matchesRaidRequirement(state, cardDef.raid, permanent, { raidCardDef: cardDef, sourceKind: context.sourceKind })) return;
       candidates.push({ lineName, index, permanent });
     });
   }
   if (candidates.length === 0) return;
+
+  resolveRuntimeChoices(state, playerId, effect, context, {
+    kind: "raidSourceFromZone",
+    cards: [cardRef],
+    ownerId: playerId,
+    raidTargets: candidates.map((candidate) => ({
+      player: playerId,
+      line: candidate.lineName,
+      index: candidate.index,
+      permanentId: candidate.permanent.pid
+    }))
+  });
 
   const chosen = context.choices?.[effect.choiceKey ?? "raidTarget"];
   const target = Number.isInteger(chosen)
@@ -1796,15 +2891,24 @@ function raidSourceFromZone(state, playerId, effect, context = {}) {
 
   found.zone.splice(found.index, 1);
   const raidedDef = topDef(state, target.permanent);
+  resetPermanentForRaid(target.permanent);
   target.permanent.cards.push(cardRef);
   readyPermanent(target.permanent);
 
-  const moveToFront = context.choices?.[effect.moveChoiceKey ?? "moveToFront"] ?? effect.moveToFrontDefault ?? true;
-  if (target.lineName === LINES.ENERGY && moveToFront && player.frontLine.length < MAX_LINE_SIZE) {
+  const moveReplaceChoiceKey = effect.moveReplaceChoiceKey ?? effect.replaceChoiceKey ?? "replaceIndex";
+  const moveToFront = context.choices?.[effect.moveChoiceKey ?? "moveToFront"]
+    ?? effect.moveToFrontDefault
+    ?? (player.frontLine.length < lineCapacity(state, playerId, LINES.FRONT));
+  if (target.lineName === LINES.ENERGY && moveToFront) {
+    assertRule(permanentCanEnterLine(state, playerId, target.permanent, LINES.FRONT, { operation: "move" }), "LINE_RESTRICTION", "This raided character cannot move to the front line.");
     const currentLocation = findPermanentLocation(player, target.permanent.pid);
     if (currentLocation?.lineName === LINES.ENERGY) {
       const moved = removeFromLine(player, LINES.ENERGY, currentLocation.index);
-      insertPermanent(state, playerId, LINES.FRONT, moved, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+      insertPermanent(state, playerId, LINES.FRONT, moved, context.choices?.[moveReplaceChoiceKey], {
+        operation: "move",
+        sourcePermanent: target.permanent,
+        choices: context.choices
+      });
       resolveCharacterMovedOutsideMovementPhase(state, playerId, moved, LINES.ENERGY, LINES.FRONT, context);
     }
   }
@@ -1877,17 +2981,23 @@ function useEventFromZone(state, playerId, effect, context = {}) {
 
   assertCanUseCard(state, playerId, cardDef, { sourceZone });
   const apCost = apCostForCardUse(state, playerId, cardDef, { sourceZone });
-  payAp(player, apCost);
+  payAp(state, playerId, apCost);
   payUseRestrictionCosts(state, playerId, cardDef, context.choices);
   consumeRequiredEnergyReductions(state, playerId, cardDef, { sourceZone });
   consumeApCostReductions(state, playerId, cardDef, { sourceZone });
   source.splice(chosenIndex, 1);
   flagEventUsed(state, playerId);
-  resolveEffect(state, playerId, cardDef.eventEffect, { card: cardRef, choices: context.choices });
+  resolveEffect(state, playerId, cardDef.eventEffect, {
+    card: cardRef,
+    choices: context.choices,
+    sourceDef: cardDef,
+    sourceZone
+  });
   placeCardInZone(state, player, effect.destination ?? "removal", cardRef);
 }
 
 function resolveTriggerAbilityOnly(state, playerId, cardRef, trigger, choices) {
+  const sourceDef = defOf(state, cardRef);
   switch (trigger.type) {
     case TRIGGER_TYPES.GET: {
       const owner = getPlayer(state, cardRef.owner);
@@ -1910,10 +3020,10 @@ function resolveTriggerAbilityOnly(state, playerId, cardRef, trigger, choices) {
     case TRIGGER_TYPES.SPECIAL:
     case TRIGGER_TYPES.FINAL:
     case "raid":
-      if (trigger.effect) resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices });
+      if (trigger.effect) resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices, sourceDef, sourceKind: "trigger" });
       break;
     default:
-      if (trigger.effect) resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices });
+      if (trigger.effect) resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices, sourceDef, sourceKind: "trigger" });
       break;
   }
 }
@@ -1990,7 +3100,8 @@ function restEnergyLineForRequiredEnergyTotal(state, playerId, effect, context =
     .map((permanent, index) => ({ permanent, index }))
     .filter(({ permanent }) => !permanent.rested)
     .map(({ index }) => index);
-  const indices = context.choices?.[effect.choiceKey ?? "energyRestIndices"] ?? defaultIndices;
+  const requested = context.choices?.[effect.choiceKey ?? "energyRestIndices"] ?? defaultIndices;
+  const indices = requested.map((choice) => choice && typeof choice === "object" ? choice.index : choice);
   let total = 0;
   for (const index of indices) {
     const permanent = player.energyLine[index];
@@ -2062,8 +3173,13 @@ function moveTargetsToLine(state, playerId, effect, context = {}) {
   let removalCount = 0;
   mutateTargetsInReverse(targets, (target) => {
     if (target.lineName === effect.destinationLine) return;
+    if (abilityActionPreventedByAbility(state, target.playerId, target.permanent, "move", context)) return;
     const permanent = removeFromLine(getPlayer(state, target.playerId), target.lineName, target.index);
-    const roomResult = insertPermanent(state, target.playerId, effect.destinationLine, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+    const roomResult = insertPermanent(state, target.playerId, effect.destinationLine, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"], {
+      operation: "move",
+      sourcePermanent: context.permanent,
+      choices: context.choices
+    });
     removalCount += roomResult?.removalDelta ?? 0;
     resolveCharacterMovedOutsideMovementPhase(state, target.playerId, permanent, target.lineName, effect.destinationLine, context);
   });
@@ -2077,13 +3193,18 @@ function swapSourceWithOtherLine(state, playerId, effect, context = {}) {
   if (!sourceLocation) return;
 
   const otherLine = sourceLocation.lineName === LINES.FRONT ? LINES.ENERGY : LINES.FRONT;
-  const targetIndex = context.choices?.[effect.choiceKey ?? "swapTargetIndex"] ?? player[otherLine]
+  const rawTarget = context.choices?.[effect.choiceKey ?? "swapTargetIndex"];
+  const targetIndex = (rawTarget && typeof rawTarget === "object" ? rawTarget.index : rawTarget) ?? player[otherLine]
     .findIndex((permanent) => isCharacter(state, permanent));
   if (targetIndex === -1 || targetIndex === undefined) return;
 
   const target = player[otherLine][targetIndex];
   if (!target || !isCharacter(state, target)) return;
   const sourcePermanent = context.permanent;
+  if (abilityActionPreventedByAbility(state, playerId, sourcePermanent, "move", context)
+    || abilityActionPreventedByAbility(state, playerId, target, "move", context)) return;
+  assertRule(permanentCanEnterLine(state, playerId, sourcePermanent, otherLine, { operation: "move", sourcePermanent }), "LINE_RESTRICTION", "The source character cannot move to the other line.");
+  assertRule(permanentCanEnterLine(state, playerId, target, sourceLocation.lineName, { operation: "move", sourcePermanent }), "LINE_RESTRICTION", "The chosen character cannot move to the other line.");
   player[otherLine][targetIndex] = context.permanent;
   player[sourceLocation.lineName][sourceLocation.index] = target;
   resolveCharacterMovedOutsideMovementPhase(state, playerId, sourcePermanent, sourceLocation.lineName, otherLine, context);
@@ -2097,12 +3218,17 @@ function swapTargetsWithOtherLine(state, playerId, effect, context = {}) {
     const location = findPermanentLocation(player, target.permanent.pid);
     if (!location) continue;
     const otherLine = location.lineName === LINES.FRONT ? LINES.ENERGY : LINES.FRONT;
-    const targetIndex = context.choices?.[effect.swapChoiceKey ?? "swapTargetIndex"] ?? player[otherLine]
+    const rawSwapTarget = context.choices?.[effect.swapChoiceKey ?? "swapTargetIndex"];
+    const targetIndex = (rawSwapTarget && typeof rawSwapTarget === "object" ? rawSwapTarget.index : rawSwapTarget) ?? player[otherLine]
       .findIndex((permanent) => isCharacter(state, permanent));
     if (targetIndex === -1 || targetIndex === undefined) continue;
     const other = player[otherLine][targetIndex];
     if (!other || !isCharacter(state, other)) continue;
     const moved = player[location.lineName][location.index];
+    if (abilityActionPreventedByAbility(state, target.playerId, moved, "move", context)
+      || abilityActionPreventedByAbility(state, target.playerId, other, "move", context)) continue;
+    assertRule(permanentCanEnterLine(state, target.playerId, moved, otherLine, { operation: "move", sourcePermanent: context.permanent }), "LINE_RESTRICTION", "The chosen character cannot move to the other line.");
+    assertRule(permanentCanEnterLine(state, target.playerId, other, location.lineName, { operation: "move", sourcePermanent: context.permanent }), "LINE_RESTRICTION", "The other character cannot move to the chosen line.");
     player[otherLine][targetIndex] = moved;
     player[location.lineName][location.index] = other;
     resolveCharacterMovedOutsideMovementPhase(state, target.playerId, moved, location.lineName, otherLine, context);
@@ -2112,21 +3238,48 @@ function swapTargetsWithOtherLine(state, playerId, effect, context = {}) {
 
 function moveOrSwapTargetsToOtherLine(state, playerId, effect, context = {}) {
   const targets = selectPermanentTargets(state, playerId, effect.target ?? { controller: "self", line: "field", type: CARD_TYPES.CHARACTER }, context);
-  for (const target of targets) {
+  const rawMoveOrSwapChoices = context.choices?.[effect.swapChoiceKey ?? "moveOrSwapTargets"];
+  for (let targetOrdinal = 0; targetOrdinal < targets.length; targetOrdinal += 1) {
+    const target = targets[targetOrdinal];
     const player = getPlayer(state, target.playerId);
     const location = findPermanentLocation(player, target.permanent.pid);
     if (!location) continue;
+    if (abilityActionPreventedByAbility(state, target.playerId, target.permanent, "move", context)) continue;
     const otherLine = location.lineName === LINES.FRONT ? LINES.ENERGY : LINES.FRONT;
-    if (lineOf(player, otherLine).length < MAX_LINE_SIZE) {
+    const rawChoice = Array.isArray(rawMoveOrSwapChoices)
+      ? rawMoveOrSwapChoices[targetOrdinal]
+      : rawMoveOrSwapChoices && typeof rawMoveOrSwapChoices === "object"
+        && !rawMoveOrSwapChoices.operation && rawMoveOrSwapChoices.index === undefined && !rawMoveOrSwapChoices.permanentId
+        ? rawMoveOrSwapChoices[target.permanent.pid]
+        : rawMoveOrSwapChoices;
+    const explicitlyMove = rawChoice === "move" || rawChoice?.operation === "move";
+    const explicitlySwap = rawChoice === "swap" || rawChoice?.operation === "swap"
+      || (rawChoice && typeof rawChoice === "object" && (rawChoice.index !== undefined || rawChoice.permanentId));
+    if (!explicitlySwap && lineOf(player, otherLine).length < lineCapacity(state, target.playerId, otherLine)
+      && permanentCanEnterLine(state, target.playerId, target.permanent, otherLine, { operation: "move", sourcePermanent: context.permanent })) {
       const permanent = removeFromLine(player, location.lineName, location.index);
-      insertPermanent(state, target.playerId, otherLine, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+      insertPermanent(state, target.playerId, otherLine, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"], {
+        operation: "move",
+        sourcePermanent: context.permanent,
+        choices: context.choices
+      });
       resolveCharacterMovedOutsideMovementPhase(state, target.playerId, permanent, location.lineName, otherLine, context);
       continue;
     }
-    const otherIndex = lineOf(player, otherLine).findIndex((permanent) => isCharacter(state, permanent));
+    if (explicitlyMove) continue;
+    const requestedPermanentId = rawChoice?.permanentId ?? rawChoice?.pid;
+    const requestedIndex = rawChoice && typeof rawChoice === "object" ? Number(rawChoice.index) : undefined;
+    const otherIndex = requestedPermanentId
+      ? lineOf(player, otherLine).findIndex((permanent) => permanent.pid === requestedPermanentId)
+      : Number.isInteger(requestedIndex)
+        ? requestedIndex
+        : lineOf(player, otherLine).findIndex((permanent) => isCharacter(state, permanent));
     if (otherIndex === -1) continue;
     const other = player[otherLine][otherIndex];
     const moved = player[location.lineName][location.index];
+    if (abilityActionPreventedByAbility(state, target.playerId, other, "move", context)) continue;
+    if (!permanentCanEnterLine(state, target.playerId, moved, otherLine, { operation: "move", sourcePermanent: context.permanent })) continue;
+    if (!permanentCanEnterLine(state, target.playerId, other, location.lineName, { operation: "move", sourcePermanent: context.permanent })) continue;
     player[otherLine][otherIndex] = moved;
     player[location.lineName][location.index] = other;
     resolveCharacterMovedOutsideMovementPhase(state, target.playerId, moved, location.lineName, otherLine, context);
@@ -2137,6 +3290,12 @@ function moveOrSwapTargetsToOtherLine(state, playerId, effect, context = {}) {
 function replayTargets(state, playerId, effect, context = {}) {
   const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
   mutateTargetsInReverse(targets, (target) => {
+    if (permanentZoneMovePreventedByAbility(state, target.playerId, target.permanent, "sideline", {
+      sourcePlayer: playerId,
+      sourceDef: context.sourceDef,
+      sourceKind: context.sourceKind,
+      byAbility: true
+    })) return;
     const permanent = removeFromLine(getPlayer(state, target.playerId), target.lineName, target.index);
     const sourceCard = topCard(permanent);
     movePermanentCardsToZone(state, permanent, "sideline", { sidelined: true });
@@ -2147,7 +3306,10 @@ function replayTargets(state, playerId, effect, context = {}) {
 
     const cardRef = owner.sideline.splice(sidelineIndex, 1)[0];
     const newPermanent = createPermanent(state, target.playerId, cardRef, effect.rested ?? false);
-    insertPermanent(state, target.playerId, effect.destinationLine ?? target.lineName, newPermanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+    insertPermanent(state, target.playerId, effect.destinationLine ?? target.lineName, newPermanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"], {
+      operation: "play",
+      choices: context.choices
+    });
     resolvePermanentAbilities(state, target.playerId, newPermanent, TIMINGS.WHEN_PLAYED, { permanent: newPermanent, choices: context.choices, playedByAbility: true });
   });
 }
@@ -2155,11 +3317,17 @@ function replayTargets(state, playerId, effect, context = {}) {
 function swapOwnFrontAndEnergy(state, playerId, effect, context = {}) {
   const targetPlayerId = effect.player === "opponent" ? opponentOf(playerId) : effect.player ?? playerId;
   const player = getPlayer(state, targetPlayerId);
-  const frontIndex = context.choices?.[effect.frontChoiceKey ?? "frontIndex"] ?? 0;
-  const energyIndex = context.choices?.[effect.energyChoiceKey ?? "energyIndex"] ?? 0;
+  const rawFront = context.choices?.[effect.frontChoiceKey ?? "frontIndex"];
+  const rawEnergy = context.choices?.[effect.energyChoiceKey ?? "energyIndex"];
+  const frontIndex = (rawFront && typeof rawFront === "object" ? rawFront.index : rawFront) ?? 0;
+  const energyIndex = (rawEnergy && typeof rawEnergy === "object" ? rawEnergy.index : rawEnergy) ?? 0;
   const front = player.frontLine[frontIndex];
   const energy = player.energyLine[energyIndex];
   if (!front || !energy) return;
+  if (abilityActionPreventedByAbility(state, targetPlayerId, front, "move", context)
+    || abilityActionPreventedByAbility(state, targetPlayerId, energy, "move", context)) return;
+  assertRule(permanentCanEnterLine(state, targetPlayerId, front, LINES.ENERGY, { operation: "move", sourcePermanent: context.permanent }), "LINE_RESTRICTION", "The front-line card cannot move to the energy line.");
+  assertRule(permanentCanEnterLine(state, targetPlayerId, energy, LINES.FRONT, { operation: "move", sourcePermanent: context.permanent }), "LINE_RESTRICTION", "The energy-line card cannot move to the front line.");
   player.frontLine[frontIndex] = energy;
   player.energyLine[energyIndex] = front;
   resolveCharacterMovedOutsideMovementPhase(state, targetPlayerId, front, LINES.FRONT, LINES.ENERGY, context);
@@ -2179,6 +3347,10 @@ function swapChosenTargets(state, playerId, effect, context = {}) {
 
   const firstPermanent = player[firstLocation.lineName][firstLocation.index];
   const secondPermanent = player[secondLocation.lineName][secondLocation.index];
+  if (abilityActionPreventedByAbility(state, first.playerId, firstPermanent, "move", context)
+    || abilityActionPreventedByAbility(state, first.playerId, secondPermanent, "move", context)) return;
+  assertRule(permanentCanEnterLine(state, first.playerId, firstPermanent, secondLocation.lineName, { operation: "move", sourcePermanent: context.permanent }), "LINE_RESTRICTION", "The first chosen card cannot move to the other line.");
+  assertRule(permanentCanEnterLine(state, first.playerId, secondPermanent, firstLocation.lineName, { operation: "move", sourcePermanent: context.permanent }), "LINE_RESTRICTION", "The second chosen card cannot move to the other line.");
   player[firstLocation.lineName][firstLocation.index] = secondPermanent;
   player[secondLocation.lineName][secondLocation.index] = firstPermanent;
   resolveCharacterMovedOutsideMovementPhase(state, first.playerId, firstPermanent, firstLocation.lineName, secondLocation.lineName, context);
@@ -2186,25 +3358,61 @@ function swapChosenTargets(state, playerId, effect, context = {}) {
 }
 
 function moveCardBetweenZones(state, playerId, effect, context = {}) {
+  context.lastEffectMovedCardCount = 0;
+  context.lastMovedCards = [];
   const sourcePlayerId = effect.player === "opponent" ? opponentOf(playerId) : effect.player ?? playerId;
   const destinationPlayerId = effect.destinationPlayer === "opponent" ? opponentOf(playerId) : effect.destinationPlayer ?? sourcePlayerId;
   const sourcePlayer = getPlayer(state, sourcePlayerId);
   const destinationPlayer = getPlayer(state, destinationPlayerId);
-  const source = zoneOf(sourcePlayer, effect.source ?? "sideline");
-  const destination = zoneOf(destinationPlayer, effect.destination ?? "hand");
-  const count = effect.all ? source.filter((card) => cardMatchesFilter(state, card, effect.filter)).length : effect.count ?? effect.amount ?? 1;
-  const choiceKey = effect.choiceKey ?? `${effect.source ?? "sideline"}Index`;
-  const chosen = context.choices?.[choiceKey] ?? effect.indices;
-  const defaultIndices = source
+  const sourceName = effect.source ?? "sideline";
+  const destinationName = effect.destination ?? "hand";
+  const source = zoneOf(sourcePlayer, sourceName);
+  const destination = zoneOf(destinationPlayer, destinationName);
+  const count = effect.all ? source.filter((card) => cardMatchesEffectFilter(state, card, effect.filter, context)).length : effect.count ?? effect.amount ?? 1;
+  const matchingEntries = source
     .map((card, index) => ({ card, index }))
-    .filter(({ card }) => cardMatchesFilter(state, card, effect.filter))
+    .filter(({ card }) => cardMatchesEffectFilter(state, card, effect.filter, context));
+  const minimum = effect.all
+    ? count
+    : Math.min(matchingEntries.length, Number(effect.min ?? effect.requiredMovedCountForFollowing ?? count));
+  const choiceKey = effect.choiceKey ?? `${sourceName}Index`;
+  const revealedOpponentHandUids = new Set(context.revealedOpponentHandCardUids ?? []);
+  const chooserKnowsSourceCards = sourceName === "hand"
+    && sourcePlayerId === opponentOf(playerId)
+    && matchingEntries.every(({ card }) => revealedOpponentHandUids.has(card.uid));
+  if (!effect.all && matchingEntries.length > 0 && chooserKnowsSourceCards) {
+    resolveRuntimeChoices(state, playerId, effect, context, {
+      kind: "chooseRevealedZoneCards",
+      cards: source,
+      ownerId: sourcePlayerId,
+      destinationPlayerId,
+      sourceName,
+      destinationName,
+      position: effect.position,
+      matchingIndices: matchingEntries.map(({ index }) => index),
+      min: minimum,
+      max: Math.min(count, matchingEntries.length),
+      choiceKey
+    });
+  }
+  const chosen = context.choices?.[choiceKey] ?? effect.indices;
+  const defaultIndices = matchingEntries
     .slice(0, count)
     .map(({ index }) => index);
-  const selectedIndices = Array.isArray(chosen) ? chosen : Number.isInteger(chosen) ? [chosen] : defaultIndices;
-  if (selectedIndices.length === 0) return;
-  assertRule(selectedIndices.length <= count, "ZONE_SELECTION", "Too many zone cards selected.", {
+  const selectedRefs = Array.isArray(chosen) ? chosen : chosen !== undefined ? [chosen] : defaultIndices;
+  assertRule(selectedRefs.length >= minimum && selectedRefs.length <= count, "ZONE_SELECTION", "A legal number of zone cards must be selected.", {
+    minimum,
     count,
-    selectedIndices
+    selected: selectedRefs
+  });
+  if (selectedRefs.length === 0) return;
+  const selectedIndices = selectedRefs.map((selected) => {
+    if (selected?.uid) return source.findIndex((card) => card.uid === selected.uid);
+    if (selected && typeof selected === "object") return selected.index;
+    return selected;
+  });
+  assertRule(new Set(selectedIndices).size === selectedIndices.length, "ZONE_SELECTION", "The same zone card cannot be selected more than once.", {
+    selected: selectedRefs
   });
 
   const moved = [];
@@ -2214,15 +3422,13 @@ function moveCardBetweenZones(state, playerId, effect, context = {}) {
       chosenIndex
     });
     const card = source[chosenIndex];
-    assertRule(cardMatchesFilter(state, card, effect.filter), "ZONE_SELECTION", "Chosen card does not match effect filter.", {
+    assertRule(cardMatchesEffectFilter(state, card, effect.filter, context), "ZONE_SELECTION", "Chosen card does not match effect filter.", {
       chosenIndex,
       filter: effect.filter
     });
     moved.unshift(source.splice(chosenIndex, 1)[0]);
   }
 
-  const destinationName = effect.destination ?? "hand";
-  const sourceName = effect.source ?? "sideline";
   if (effect.position === "top") {
     for (const card of [...moved].reverse()) {
       placeCardInZone(state, destinationPlayer, destinationName, card, { position: "top" });
@@ -2283,6 +3489,7 @@ function moveEqualCountsBetweenZones(state, playerId, effect, context = {}) {
 function moveTargetsToBottomDeck(state, playerId, effect, context = {}) {
   const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
   mutateTargetsInReverse(targets, (target) => {
+    if (permanentZoneMovePreventedByAbility(state, target.playerId, target.permanent, "deck", { sourcePlayer: playerId, byAbility: true })) return;
     const permanent = removeFromLine(getPlayer(state, target.playerId), target.lineName, target.index);
     getPlayer(state, permanent.owner).deck.push(...permanent.cards);
   });
@@ -2298,6 +3505,7 @@ function moveTargetsToDeck(state, playerId, effect, context = {}) {
     });
   }
   mutateTargetsInReverse(targets, (target) => {
+    if (permanentZoneMovePreventedByAbility(state, target.playerId, target.permanent, "deck", { sourcePlayer: playerId, byAbility: true })) return;
     const permanent = removeFromLine(getPlayer(state, target.playerId), target.lineName, target.index);
     const owner = getPlayer(state, permanent.owner);
     if (position === "bottom") owner.deck.push(...permanent.cards);
@@ -2308,6 +3516,7 @@ function moveTargetsToDeck(state, playerId, effect, context = {}) {
 function moveTargetsToLife(state, playerId, effect, context = {}) {
   const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
   mutateTargetsInReverse(targets, (target) => {
+    if (permanentZoneMovePreventedByAbility(state, target.playerId, target.permanent, "life", { sourcePlayer: playerId, byAbility: true })) return;
     const permanent = removeFromLine(getPlayer(state, target.playerId), target.lineName, target.index);
     const owner = getPlayer(state, permanent.owner);
     for (const card of permanent.cards) {
@@ -2342,9 +3551,43 @@ function moveUnderCardsToZone(state, playerId, effect, context = {}) {
   for (const target of targets) {
     const destination = zoneOf(getPlayer(state, target.permanent.owner), effect.destination ?? "hand");
     const count = effect.all ? Math.max(0, target.permanent.cards.length - 1) : effect.count ?? effect.amount ?? 1;
-    for (let i = 0; i < count; i += 1) {
-      if (target.permanent.cards.length <= 1) break;
-      const card = target.permanent.cards.shift();
+    const availableCount = Math.max(0, target.permanent.cards.length - 1);
+    const moveCount = Math.min(count, availableCount);
+    const choiceKey = effect.choiceKey ?? "underCardChoices";
+    const requestedChoices = effect.all ? undefined : context.choices?.[choiceKey];
+    const matchingChoices = Array.isArray(requestedChoices)
+      ? requestedChoices.filter((choice) => !choice?.permanentId || choice.permanentId === target.permanent.pid)
+      : requestedChoices !== undefined ? [requestedChoices] : undefined;
+    const selectedIndices = matchingChoices
+      ? matchingChoices.map((choice) => {
+          if (choice && typeof choice === "object") {
+            if (choice.uid) return target.permanent.cards.findIndex((card, index) => index < availableCount && card.uid === choice.uid);
+            return Number(choice.underIndex ?? choice.index);
+          }
+          return Number(choice);
+        })
+      : [...Array(moveCount).keys()];
+    assertRule(selectedIndices.length === moveCount, "UNDER_CARD_SELECTION", "Effect requires the correct number of under cards.", {
+      selected: selectedIndices.length,
+      moveCount,
+      permanentId: target.permanent.pid
+    });
+    assertRule(new Set(selectedIndices).size === selectedIndices.length, "UNDER_CARD_SELECTION", "The same under card cannot be selected twice.", {
+      selectedIndices,
+      permanentId: target.permanent.pid
+    });
+    for (const index of selectedIndices) {
+      assertRule(index >= 0 && index < availableCount, "UNDER_CARD_SELECTION", "Selected under-card index is out of range.", {
+        index,
+        availableCount,
+        permanentId: target.permanent.pid
+      });
+    }
+    const selectedCards = selectedIndices.map((index) => target.permanent.cards[index]);
+    for (const index of [...selectedIndices].sort((left, right) => right - left)) {
+      target.permanent.cards.splice(index, 1);
+    }
+    for (const card of selectedCards) {
       card.faceUp = effect.faceUp ?? true;
       destination.push(card);
       movedCount += 1;
@@ -2364,8 +3607,14 @@ function moveHandCardsUnderPermanent(state, playerId, effect, permanent, context
     .filter(({ card }) => cardMatchesFilter(state, card, effect.filter ?? {}))
     .slice(0, count)
     .map(({ index }) => index);
-  const indices = Array.isArray(chosen) ? chosen : Number.isInteger(chosen) ? [chosen] : defaultIndices;
+  const selectedRefs = Array.isArray(chosen) ? chosen : chosen !== undefined ? [chosen] : defaultIndices;
+  const indices = selectedRefs.map((selected) => {
+    if (selected?.uid) return player.hand.findIndex((card) => card.uid === selected.uid);
+    if (selected && typeof selected === "object") return Number(selected.index);
+    return Number(selected);
+  });
   assertRule(indices.length >= min && indices.length <= count, "HAND_SELECTION", "Effect requires a legal hand selection count.", { min, count, indices });
+  assertRule(new Set(indices).size === indices.length, "HAND_SELECTION", "The same hand card cannot be selected twice.", { indices });
 
   const moved = [];
   for (const index of [...indices].sort((a, b) => b - a)) {
@@ -2400,14 +3649,7 @@ function moveHandCardsUnderTargets(state, playerId, effect, context = {}) {
 
 function moveZoneCardsUnderSelf(state, playerId, effect, context = {}) {
   assertRule(context.permanent, "EFFECT_SOURCE", "This effect requires a source permanent.");
-  const player = getPlayer(state, playerId);
-  const source = zoneOf(player, effect.source ?? "sideline");
-  const count = effect.count ?? effect.amount ?? 1;
-
-  for (let moved = 0; moved < count; moved += 1) {
-    const index = source.findIndex((card) => cardMatchesFilter(state, card, effect.filter));
-    if (index === -1) return;
-    const card = source.splice(index, 1)[0];
+  for (const card of takeZoneCardsForUnder(state, playerId, effect, context)) {
     card.faceUp = effect.faceUp ?? false;
     const topIndex = Math.max(0, context.permanent.cards.length - 1);
     context.permanent.cards.splice(topIndex, 0, card);
@@ -2415,20 +3657,57 @@ function moveZoneCardsUnderSelf(state, playerId, effect, context = {}) {
 }
 
 function moveZoneCardsUnderTargets(state, playerId, effect, context = {}) {
-  const player = getPlayer(state, playerId);
-  const source = zoneOf(player, effect.source ?? "sideline");
   const targets = selectPermanentTargets(state, playerId, effect.target, context);
-  const count = effect.count ?? effect.amount ?? 1;
   for (const target of targets) {
-    for (let moved = 0; moved < count; moved += 1) {
-      const index = source.findIndex((card) => cardMatchesFilter(state, card, effect.filter));
-      if (index === -1) return;
-      const card = source.splice(index, 1)[0];
+    for (const card of takeZoneCardsForUnder(state, playerId, effect, context)) {
       card.faceUp = effect.faceUp ?? false;
       const topIndex = Math.max(0, target.permanent.cards.length - 1);
       target.permanent.cards.splice(topIndex, 0, card);
     }
   }
+}
+
+function takeZoneCardsForUnder(state, playerId, effect, context = {}) {
+  const player = getPlayer(state, playerId);
+  const sourceName = effect.source ?? "sideline";
+  const source = zoneOf(player, sourceName);
+  const count = Math.min(
+    Number(effect.count ?? effect.amount ?? 1),
+    source.filter((card) => cardMatchesFilter(state, card, effect.filter ?? {})).length
+  );
+  const min = Math.min(count, Number(effect.min ?? count));
+  const choiceKey = effect.choiceKey ?? `${sourceName}UnderCards`;
+  const chosen = context.choices?.[choiceKey];
+  const defaultSelections = source
+    .map((card, index) => ({ card, index }))
+    .filter(({ card }) => cardMatchesFilter(state, card, effect.filter ?? {}))
+    .slice(0, count)
+    .map(({ index }) => index);
+  const selectedRefs = Array.isArray(chosen) ? chosen : chosen !== undefined ? [chosen] : defaultSelections;
+  assertRule(selectedRefs.length >= min && selectedRefs.length <= count, "ZONE_SELECTION", "Effect requires a legal number of cards to move underneath.", {
+    selected: selectedRefs.length,
+    min,
+    count,
+    source: sourceName
+  });
+  const selectedIndices = selectedRefs.map((selected) => {
+    if (selected?.uid) return source.findIndex((card) => card.uid === selected.uid);
+    if (selected && typeof selected === "object") return Number(selected.index);
+    return Number(selected);
+  });
+  assertRule(new Set(selectedIndices).size === selectedIndices.length, "ZONE_SELECTION", "The same zone card cannot be moved underneath twice.", {
+    selectedIndices
+  });
+  for (const index of selectedIndices) {
+    assertRule(index >= 0 && index < source.length, "ZONE_SELECTION", "Selected under-source card does not exist.", { index, source: sourceName });
+    assertRule(cardMatchesFilter(state, source[index], effect.filter ?? {}), "ZONE_SELECTION", "Selected card does not match the under-card filter.", {
+      index,
+      filter: effect.filter
+    });
+  }
+  const cards = selectedIndices.map((index) => source[index]);
+  for (const index of [...selectedIndices].sort((left, right) => right - left)) source.splice(index, 1);
+  return cards;
 }
 
 function placeTopDeckUnderTargets(state, playerId, effect, context = {}) {
@@ -2471,6 +3750,9 @@ function moveSelfCardToZone(state, playerId, effect, context = {}) {
       removePermanentToZone(state, context.permanent.controller, location.lineName, location.index, effect.destination ?? "hand", {
         sidelined: effect.destination === "sideline",
         sourcePlayer: playerId,
+        byAbility: true,
+        sourceDef: context.sourceDef,
+        sourceKind: context.sourceKind,
         choices: context.choices
       });
       return;
@@ -2553,7 +3835,10 @@ function playBaseCardFromSelf(state, playerId, effect, context = {}) {
   if (context.permanent.cards.length <= 1) return;
   const card = context.permanent.cards.splice(0, 1)[0];
   const permanent = createPermanent(state, playerId, card, effect.rested ?? true);
-  insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"]);
+  insertPermanent(state, playerId, effect.destinationLine ?? LINES.FRONT, permanent, context.choices?.[effect.replaceChoiceKey ?? "replaceIndex"], {
+    operation: "play",
+    choices: context.choices
+  });
   resolvePermanentAbilities(state, playerId, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: context.choices, playedByAbility: true });
 }
 
@@ -2562,7 +3847,7 @@ function sidelineTargetsThenActivateSourceWhenPlayed(state, playerId, effect, co
   const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
   const removed = [];
   mutateTargetsInReverse(targets, (target) => {
-    removed.push(removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: false, sourcePlayer: playerId, choices: context.choices }));
+    removed.push(removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: false, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices }));
   });
   if (removed.length === 0) return;
 
@@ -2596,6 +3881,19 @@ function opponentMaySidelineChosenTargetsElse(state, playerId, effect, context =
     return;
   }
 
+  resolveRuntimeChoices(state, opponentOf(playerId), effect, context, {
+    kind: "opponentMaySidelineChosenTargetsElse",
+    cards: [],
+    ownerId: opponentOf(playerId),
+    initiatingPlayerId: playerId,
+    targets: chosenTargets.map((target) => ({
+      player: target.playerId,
+      line: target.lineName,
+      index: target.index,
+      permanentId: target.permanent.pid
+    }))
+  });
+
   const choice = context.choices?.[effect.choiceKey ?? "opponentSidelineChoice"];
   if (choice === false || choice === null || choice === "decline") {
     if (effect.elseEffect) resolveEffect(state, playerId, effect.elseEffect, context);
@@ -2610,7 +3908,14 @@ function opponentMaySidelineChosenTargetsElse(state, playerId, effect, context =
     if (effect.elseEffect) resolveEffect(state, playerId, effect.elseEffect, context);
     return;
   }
-  removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: true, sourcePlayer: playerId, choices: context.choices });
+  removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", {
+    sidelined: true,
+    sourcePlayer: playerId,
+    sourceDef: context.sourceDef,
+    sourceKind: context.sourceKind,
+    byAbility: true,
+    choices: context.choices
+  });
 }
 
 function opponentMayMoveCardsBetweenZonesElse(state, playerId, effect, context = {}) {
@@ -2624,11 +3929,27 @@ function opponentMayMoveCardsBetweenZonesElse(state, playerId, effect, context =
     .map((card, index) => ({ card, index }))
     .filter(({ card }) => cardMatchesFilter(state, card, effect.filter ?? {}));
   const canMove = matching.length >= count;
+  resolveRuntimeChoices(state, opponentId, effect, context, {
+    kind: "opponentMayMoveCardsBetweenZonesElse",
+    cards: source,
+    ownerId: opponentId,
+    initiatingPlayerId: playerId,
+    sourceName,
+    destinationName,
+    matchingIndices: matching.map(({ index }) => index),
+    count,
+    canMove
+  });
   const choice = context.choices?.[effect.choiceKey ?? "opponentZoneMoveChoice"];
 
   if (canMove && choice !== false && choice !== "decline") {
-    const chosenIndices = context.choices?.[effect.indicesChoiceKey ?? "opponentZoneMoveIndices"]
+    const chosenRefs = context.choices?.[effect.indicesChoiceKey ?? "opponentZoneMoveIndices"]
       ?? matching.slice(0, count).map(({ index }) => index);
+    const chosenIndices = chosenRefs.map((selected) => {
+      if (selected?.uid) return source.findIndex((card) => card.uid === selected.uid);
+      if (selected && typeof selected === "object") return Number(selected.index);
+      return Number(selected);
+    });
     assertRule(chosenIndices.length === count, "ZONE_SELECTION", "Opponent zone move requires the exact card count.", {
       count,
       chosenIndices
@@ -2645,7 +3966,8 @@ function opponentMayMoveCardsBetweenZonesElse(state, playerId, effect, context =
       });
       moved.unshift(source.splice(index, 1)[0]);
     }
-    zoneOf(opponent, destinationName).push(...moved);
+    const destinationPlayer = effect.destinationPlayer === "self" ? getPlayer(state, playerId) : opponent;
+    zoneOf(destinationPlayer, destinationName).push(...moved);
     context.lastOpponentMovedCardCount = moved.length;
     resolveEffect(state, playerId, effect.ifMovedEffect, context);
     return;
@@ -2671,11 +3993,33 @@ function totalEnergyGeneration(state, playerId) {
     .reduce((total, permanent) => total + permanentEnergyGeneration(state, permanent), 0);
 }
 
+function permanentMatchesConditionFilter(state, permanent, filter = {}) {
+  const {
+    anyOf,
+    active,
+    rested,
+    raided,
+    notRaided,
+    bpMin,
+    bpMax,
+    ...definitionFilter
+  } = filter;
+  if (anyOf && !anyOf.some((child) => permanentMatchesConditionFilter(state, permanent, child))) return false;
+  if (!cardDefMatchesFilter(topDef(state, permanent), definitionFilter)) return false;
+  if (active !== undefined && permanent.rested === active) return false;
+  if (rested !== undefined && permanent.rested !== rested) return false;
+  if (raided && permanent.cards.length <= 1) return false;
+  if (notRaided && permanent.cards.length > 1) return false;
+  if (bpMin !== undefined && battlePower(state, permanent) < bpMin) return false;
+  if (bpMax !== undefined && battlePower(state, permanent) > bpMax) return false;
+  return true;
+}
+
 function countFieldMatches(state, playerId, filter = {}, { otherThanPermanent } = {}) {
   const player = getPlayer(state, playerId);
   return [...player.frontLine, ...player.energyLine].filter((permanent) => {
     if (otherThanPermanent && permanent.pid === otherThanPermanent.pid) return false;
-    return cardDefMatchesFilter(topDef(state, permanent), filter);
+    return permanentMatchesConditionFilter(state, permanent, filter);
   }).length;
 }
 
@@ -2683,7 +4027,7 @@ function countZoneMatches(state, playerId, zoneName, filter = {}) {
   return zoneOf(getPlayer(state, playerId), zoneName).filter((card) => cardMatchesFilter(state, card, filter)).length;
 }
 
-function conditionMet(state, playerId, condition = {}, context = {}) {
+export function conditionMet(state, playerId, condition = {}, context = {}) {
   if (!condition || Object.keys(condition).length === 0) return true;
   if (condition.allOf) return condition.allOf.every((childCondition) => conditionMet(state, playerId, childCondition, context));
   if (condition.anyOf) return condition.anyOf.some((childCondition) => conditionMet(state, playerId, childCondition, context));
@@ -2714,6 +4058,8 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
   if (condition.opponentLifeMax !== undefined && opponent.life.length > condition.opponentLifeMax) return false;
   if (condition.opponentLifeMin !== undefined && opponent.life.length < condition.opponentLifeMin) return false;
   if (condition.energyGenerationMin !== undefined && totalEnergyGeneration(state, playerId) < condition.energyGenerationMin) return false;
+  if (condition.equalEnergyGenerationWithOpponent
+    && totalEnergyGeneration(state, playerId) !== totalEnergyGeneration(state, opponentOf(playerId))) return false;
   if (condition.energyAvailableMin) {
     const available = energyAvailable(state, playerId);
     const color = condition.energyAvailableMin.color;
@@ -2722,6 +4068,10 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
   if (condition.characterSidelinedThisTurn) {
     const flagPlayerId = condition.characterSidelinedThisTurn === "opponent" ? opponentOf(playerId) : playerId;
     if (!state.turnFlags?.[flagPlayerId]?.characterSidelined) return false;
+  }
+  if (condition.sidelinedCharacter) {
+    if (!context.sidelinedPermanent) return false;
+    if (!cardDefMatchesFilter(topDef(state, context.sidelinedPermanent), condition.sidelinedCharacter)) return false;
   }
   if (condition.eventUsedThisTurn) {
     const flagPlayerId = condition.eventUsedThisTurn === "opponent" ? opponentOf(playerId) : playerId;
@@ -2740,6 +4090,7 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
   if (condition.movedSelfOutsideMovementThisTurn && (!context.permanent || !state.turnFlags?.[playerId]?.movedOutsideMovementPermanentIds?.includes(context.permanent.pid))) return false;
   if (condition.movedPermanentSelf && (!context.permanent || context.movedPermanent?.pid !== context.permanent.pid)) return false;
   if (condition.apPaidAbilityUsedThisTurn && !state.turnFlags?.[playerId]?.apPaidAbilityUsed) return false;
+  if (condition.apPaidDuringAttackPhase && !state.turnFlags?.[playerId]?.apPaidDuringAttackPhase) return false;
   if (condition.usedFromHandThisTurn) {
     const usedIds = state.turnFlags?.[playerId]?.usedFromHandCardIds ?? [];
     if (!usedIds.some((id) => state.catalog[id] && cardDefMatchesFilter(state.catalog[id], condition.usedFromHandThisTurn))) return false;
@@ -2748,6 +4099,17 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
     && !state.turnFlags?.[playerId]?.triggerAbilityActivated
     && !state.turnFlags?.[opponentOf(playerId)]?.triggerAbilityActivated) return false;
   if (condition.lastSearchSelectedMin !== undefined && (context.lastSearchSelectedCount ?? 0) < condition.lastSearchSelectedMin) return false;
+  if (condition.lastSearchSelectedCardFilter) {
+    const selected = context.lastSearchSelectedCards ?? [];
+    if (selected.length === 0 || !selected.every((card) => cardMatchesFilter(state, card, condition.lastSearchSelectedCardFilter))) return false;
+  }
+  if (condition.lastMovedCardFilter) {
+    const moved = context.lastMovedCards ?? [];
+    if (moved.length === 0 || !moved.some((card) => cardMatchesFilter(state, card, condition.lastMovedCardFilter))) return false;
+  }
+  if (condition.lastRevealedHandCountMin !== undefined && (context.lastRevealedHandCount ?? 0) < condition.lastRevealedHandCountMin) return false;
+  if (condition.lastSidelinedTargetCountMin !== undefined && (context.lastSidelinedTargetCount ?? 0) < condition.lastSidelinedTargetCountMin) return false;
+  if (condition.lastSidelinedBpMin !== undefined && (context.lastSidelinedBp ?? 0) < condition.lastSidelinedBpMin) return false;
   if (condition.playedCharacterWithTriggerTypeThisTurn) {
     const triggerType = String(condition.playedCharacterWithTriggerTypeThisTurn).toLowerCase();
     if (!state.turnFlags?.[playerId]?.playedCharacterTriggerTypes?.some((type) => String(type).toLowerCase() === triggerType)) return false;
@@ -2771,7 +4133,7 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
     const countPlayerId = condition.fieldController === "opponent" ? opponentOf(playerId) : playerId;
     const count = getPlayer(state, countPlayerId).frontLine
       .filter((permanent) => !(condition.otherThanSource && context.permanent?.pid === permanent.pid))
-      .filter((permanent) => cardDefMatchesFilter(topDef(state, permanent), condition.filter ?? {}))
+      .filter((permanent) => permanentMatchesConditionFilter(state, permanent, condition.filter ?? {}))
       .length;
     if (count < condition.frontLineCountMin) return false;
   }
@@ -2779,7 +4141,7 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
     const countPlayerId = condition.fieldController === "opponent" ? opponentOf(playerId) : playerId;
     const count = getPlayer(state, countPlayerId).frontLine
       .filter((permanent) => !(condition.otherThanSource && context.permanent?.pid === permanent.pid))
-      .filter((permanent) => cardDefMatchesFilter(topDef(state, permanent), condition.filter ?? {}))
+      .filter((permanent) => permanentMatchesConditionFilter(state, permanent, condition.filter ?? {}))
       .length;
     if (count > condition.frontLineCountMax) return false;
   }
@@ -2801,13 +4163,20 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
     if (!location) return false;
     const count = lineOf(player, location.lineName)
       .filter((permanent) => !(condition.otherThanSource && permanent.pid === context.permanent.pid))
-      .filter((permanent) => cardDefMatchesFilter(topDef(state, permanent), condition.filter ?? {}))
+      .filter((permanent) => permanentMatchesConditionFilter(state, permanent, condition.filter ?? {}))
       .length;
     if (count < condition.sameLineCountMin) return false;
   }
   if (condition.zoneCountMin !== undefined) {
     const count = countZoneMatches(state, playerId, condition.zone ?? "sideline", condition.filter ?? {});
     if (count < condition.zoneCountMin) return false;
+  }
+  if (condition.uniqueZoneNameCountMin !== undefined) {
+    const zone = zoneOf(player, condition.zone ?? "sideline");
+    const names = new Set(zone
+      .filter((card) => cardDefMatchesFilter(defOf(state, card), condition.filter ?? {}))
+      .map((card) => defOf(state, card).name.toLowerCase()));
+    if (names.size < condition.uniqueZoneNameCountMin) return false;
   }
   if (condition.combinedZoneCountMin !== undefined) {
     const count = (condition.zones ?? ["sideline", "removal"])
@@ -2825,7 +4194,7 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
   }
   if (condition.uniqueFieldNameCountMin !== undefined) {
     const names = new Set([...player.frontLine, ...player.energyLine]
-      .filter((permanent) => cardDefMatchesFilter(topDef(state, permanent), condition.filter ?? {}))
+      .filter((permanent) => permanentMatchesConditionFilter(state, permanent, condition.filter ?? {}))
       .map((permanent) => topDef(state, permanent).name.toLowerCase()));
     if (names.size < condition.uniqueFieldNameCountMin) return false;
   }
@@ -2834,12 +4203,13 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
     if (values.size < condition.differentRequiredEnergyValuesInSidelineMin) return false;
   }
   if (condition.namedOnField && countFieldMatches(state, playerId, { name: condition.namedOnField }) === 0) return false;
-  if (condition.namedOnFrontLine && !player.frontLine.some((permanent) => sameText(topDef(state, permanent).name, condition.namedOnFrontLine))) return false;
+  if (condition.namedOnFrontLine && !player.frontLine.some((permanent) => cardDefHasName(topDef(state, permanent), condition.namedOnFrontLine))) return false;
+  if (condition.namedNotOnField && countFieldMatches(state, playerId, { name: condition.namedNotOnField }) > 0) return false;
   if (condition.activeNamedOnField) {
     const field = [...player.frontLine, ...player.energyLine];
-    if (!field.some((permanent) => !permanent.rested && sameText(topDef(state, permanent).name, condition.activeNamedOnField))) return false;
+    if (!field.some((permanent) => !permanent.rested && cardDefHasName(topDef(state, permanent), condition.activeNamedOnField))) return false;
   }
-  if (condition.activeNamedOnFrontLine && !player.frontLine.some((permanent) => !permanent.rested && sameText(topDef(state, permanent).name, condition.activeNamedOnFrontLine))) return false;
+  if (condition.activeNamedOnFrontLine && !player.frontLine.some((permanent) => !permanent.rested && cardDefHasName(topDef(state, permanent), condition.activeNamedOnFrontLine))) return false;
   if (condition.opponentFieldAnyColor) {
     const colors = condition.opponentFieldAnyColor.map((color) => String(color).toLowerCase());
     const opponentField = [...opponent.frontLine, ...opponent.energyLine];
@@ -2849,7 +4219,8 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
     const count = player.frontLine.filter((permanent) => permanent.rested && isCharacter(state, permanent)).length;
     if (count < condition.restingFrontCharactersMin) return false;
   }
-  if (condition.opponentFrontLineNotFull && opponent.frontLine.length >= MAX_LINE_SIZE) return false;
+  if (condition.opponentFrontLineNotFull
+    && opponent.frontLine.length >= lineCapacity(state, opponentOf(playerId), LINES.FRONT)) return false;
   if (condition.fieldBpAboveBase) {
     const field = [...player.frontLine, ...player.energyLine];
     if (!field.some((permanent) => battlePower(state, permanent) > (topDef(state, permanent).bp ?? 0))) return false;
@@ -2866,14 +4237,17 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
   }
   if (condition.nameContainsOnField) {
     const field = [...player.frontLine, ...player.energyLine];
-    if (!field.some((permanent) => topDef(state, permanent).name.toLowerCase().includes(String(condition.nameContainsOnField).toLowerCase()))) return false;
+    if (!field.some((permanent) => namesOfCardDef(topDef(state, permanent))
+      .some((name) => name.toLowerCase().includes(String(condition.nameContainsOnField).toLowerCase())))) return false;
   }
   if (condition.nameContainsAllOnField) {
     const needles = condition.nameContainsAllOnField.map((item) => String(item).toLowerCase());
     const field = [...player.frontLine, ...player.energyLine];
     if (!field.some((permanent) => {
-      const name = topDef(state, permanent).name.toLowerCase();
-      return needles.every((needle) => name.includes(needle));
+      return namesOfCardDef(topDef(state, permanent)).some((name) => {
+        const normalized = name.toLowerCase();
+        return needles.every((needle) => normalized.includes(needle));
+      });
     })) return false;
   }
   if (condition.noAffinitiesOnField) {
@@ -2898,6 +4272,7 @@ function conditionMet(state, playerId, condition = {}, context = {}) {
 function canPayEffectCost(state, playerId, effect) {
   if (!effect) return true;
   if (effect.kind === "sequence") return (effect.effects ?? []).every((childEffect) => canPayEffectCost(state, playerId, childEffect));
+  if (effect.kind === "payAp") return activeAp(getPlayer(state, playerId)) >= (effect.amount ?? 1);
   if (effect.kind !== "moveHandToZone") return true;
   const player = getPlayer(state, playerId);
   const count = effect.count ?? effect.amount ?? 1;
@@ -2905,6 +4280,24 @@ function canPayEffectCost(state, playerId, effect) {
     ? player.hand.filter((card) => cardMatchesFilter(state, card, effect.filter)).length
     : player.hand.length;
   return matching >= (effect.min ?? count);
+}
+
+function canStartOptionalEffect(state, playerId, effect, context = {}) {
+  const first = effect?.kind === "sequence" ? effect.effects?.[0] : effect;
+  if (!first) return true;
+  if (first.kind === "playSourceFromZone") {
+    const found = findSourceCardInZone(state, playerId, context, first.source ?? "sideline");
+    if (!found) return false;
+    const cardDef = defOf(state, found.card);
+    if (first.requiredEnergyFulfilled
+      && !hasRequiredEnergy(state, playerId, cardDef, { sourceZone: found.zoneName })) return false;
+    const allowedLines = first.destinationLines?.length
+      ? first.destinationLines
+      : [first.destinationLine ?? LINES.FRONT];
+    return allowedLines.some((lineName) => cardCanEnterLine(state, playerId, cardDef, lineName, { operation: "play" }));
+  }
+  if (!["moveHandToZone", "payAp"].includes(first.kind)) return true;
+  return canPayEffectCost(state, playerId, first);
 }
 
 function drawUntilHandSize(state, playerId, effect) {
@@ -2959,21 +4352,9 @@ function scheduleLastPlayedPermanentToZone(state, playerId, effect, context = {}
 
 function uniqueRevealedAndFieldNameCount(state, playerId, effect, context = {}) {
   const player = getPlayer(state, playerId);
-  const choiceKey = effect.choiceKey ?? "revealHandIndices";
-  const defaultIndices = player.hand
-    .map((card, index) => ({ card, index }))
-    .filter(({ card }) => cardMatchesFilter(state, card, effect.filter ?? {}))
-    .map(({ index }) => index);
-  const indices = context.choices?.[choiceKey] ?? defaultIndices;
   const names = new Set();
 
-  for (const index of indices) {
-    assertRule(index >= 0 && index < player.hand.length, "HAND_INDEX", "Reveal index is out of range.", { index });
-    const card = player.hand[index];
-    assertRule(cardMatchesFilter(state, card, effect.filter ?? {}), "HAND_SELECTION", "Revealed card does not match filter.", {
-      index,
-      filter: effect.filter
-    });
+  for (const card of revealHandCardsForEffect(state, playerId, effect, context)) {
     names.add(defOf(state, card).name.toLowerCase());
   }
 
@@ -2985,6 +4366,55 @@ function uniqueRevealedAndFieldNameCount(state, playerId, effect, context = {}) 
   }
 
   return names.size;
+}
+
+function revealHandCardsForEffect(state, playerId, effect, context = {}) {
+  const player = getPlayer(state, playerId);
+  const choiceKey = effect.choiceKey ?? "revealHandIndices";
+  const maximum = effect.max ?? effect.count ?? effect.amount ?? player.hand.length;
+  const defaultIndices = player.hand
+    .map((card, index) => ({ card, index }))
+    .filter(({ card }) => cardMatchesFilter(state, card, effect.filter ?? {}))
+    .map(({ index }) => index)
+    .slice(0, maximum);
+  const chosen = context.choices?.[choiceKey];
+  const selections = Array.isArray(chosen)
+    ? chosen
+    : chosen !== undefined ? [chosen] : defaultIndices;
+  const indices = selections.map((selection) => {
+    if (selection && typeof selection === "object") {
+      if (selection.uid) return player.hand.findIndex((card) => card.uid === selection.uid);
+      return Number(selection.index);
+    }
+    return selection;
+  });
+  const revealed = [];
+  assertRule(indices.length <= maximum, "HAND_SELECTION", "Too many hand cards were revealed.", {
+    indices,
+    maximum
+  });
+  assertRule(new Set(indices).size === indices.length, "HAND_SELECTION", "The same hand card cannot be revealed more than once.", {
+    indices
+  });
+
+  for (const index of indices) {
+    assertRule(index >= 0 && index < player.hand.length, "HAND_INDEX", "Reveal index is out of range.", { index });
+    const card = player.hand[index];
+    assertRule(cardMatchesFilter(state, card, effect.filter ?? {}), "HAND_SELECTION", "Revealed card does not match filter.", {
+      index,
+      filter: effect.filter
+    });
+    revealed.push(card);
+  }
+
+  if (revealed.length > 0) {
+    recordCardsRevealedToOpponent(state, playerId, revealed, {
+      zone: "hand",
+      source: effect.kind ?? "handReveal"
+    });
+  }
+
+  return revealed;
 }
 
 function activateTargetAbility(state, playerId, effect, context = {}) {
@@ -3091,16 +4521,85 @@ function consumeContinuousEffect(state, effectToConsume) {
   state.continuousEffects = (state.continuousEffects ?? []).filter((effect) => effect !== effectToConsume);
 }
 
-function matchesRaidRequirement(state, raid, targetPermanent) {
-  if (hasKeyword(state, targetPermanent, "raidTargetForAnyRaid")) return true;
-  const targetDef = topDef(state, targetPermanent);
-  const names = raid?.names ?? [];
-  const affinities = raid?.affinities ?? [];
-  if (names.includes(targetDef.name)) return true;
-  return targetDef.affinities?.some((affinity) => affinities.includes(affinity)) ?? false;
+function raidUseConditionMet(state, playerId, cardDef, context = {}) {
+  return !cardDef.raidUseCondition || conditionMet(state, playerId, cardDef.raidUseCondition, {
+    ...context,
+    cardDef,
+    performingRaid: true
+  });
 }
 
-function resolveEffect(state, playerId, effect, context = {}) {
+function matchesRaidRequirement(state, raid, targetPermanent, options = {}) {
+  if (hasKeyword(state, targetPermanent, "raidTargetForAnyRaid")) return true;
+  const targetDef = topDef(state, targetPermanent);
+  if (!baseAbilitiesLost(targetPermanent)) {
+    const permitted = (targetDef.raidTargetPermissions ?? []).some((permission) => {
+      if (permission.sourceKind && permission.sourceKind !== options.sourceKind) return false;
+      return options.raidCardDef && cardDefMatchesFilter(options.raidCardDef, permission.sourceFilter ?? {});
+    });
+    if (permitted) return true;
+  }
+  const names = raid?.names ?? [];
+  const affinities = raid?.affinities ?? [];
+  if (names.some((name) => cardDefHasName(targetDef, name))) return true;
+  return targetDef.affinities?.some((affinity) => includesText(affinities, affinity)) ?? false;
+}
+
+function effectChoiceMaximum(state, playerId, effect, context = {}) {
+  if (effect.maxIf?.condition && conditionMet(state, playerId, effect.maxIf.condition, context)) {
+    return effect.maxIf.value ?? effect.maxIf.max ?? effect.max ?? effect.choices?.length ?? 1;
+  }
+  return effect.max ?? effect.choices?.length ?? 1;
+}
+
+function resolvedEffectAmount(state, playerId, effect) {
+  const base = Number(effect.amount ?? 0);
+  if (effect.amountPer?.kind === "eventUsedCount") {
+    return base * Number(state.turnFlags?.[playerId]?.eventUsedCount ?? 0);
+  }
+  return base;
+}
+
+function choiceTurnKey(effect, choice, index) {
+  if (!effect.uniqueChoicesPerTurn) return undefined;
+  return `choice:${effect.choiceUsageKey ?? "effect"}:${choice?.id ?? index}`;
+}
+
+function assertAndRecordTurnChoices(player, effect, selectedChoices) {
+  const keys = selectedChoices
+    .map(({ choice, index }) => choiceTurnKey(effect, choice, index))
+    .filter(Boolean);
+  for (const key of keys) {
+    assertRule(!player.usedTurnAbilityKeys.includes(key), "EFFECT_CHOICE", "That effect branch has already been chosen this turn.", { key });
+  }
+  for (const key of keys) player.usedTurnAbilityKeys.push(key);
+}
+
+function defaultChoiceIndexForTurn(player, effect) {
+  const preferred = effect.defaultIndex ?? 0;
+  if (!effect.uniqueChoicesPerTurn) return preferred;
+  const choices = effect.choices ?? [];
+  const available = choices.findIndex((choice, index) => !player.usedTurnAbilityKeys.includes(choiceTurnKey(effect, choice, index)));
+  return available;
+}
+
+function applyBpModifier(state, targetPlayerId, permanent, amount, duration = "permanent", context = {}) {
+  if (duration && duration !== "permanent") {
+    permanent.bpModifiers.push({ amount, expires: expirationFromDuration(duration) });
+  } else {
+    permanent.bpDelta += amount;
+  }
+  if (amount <= 0) return;
+  const location = findPermanentLocation(getPlayer(state, targetPlayerId), permanent.pid);
+  if (!location) return;
+  resolvePermanentAbilities(state, targetPlayerId, permanent, TIMINGS.WHEN_BP_INCREASED, {
+    ...context,
+    permanent,
+    bpIncreaseAmount: amount
+  });
+}
+
+function resolveEffectBody(state, playerId, effect, context = {}) {
   if (!effect || effect.kind === "none") return;
 
   const player = getPlayer(state, playerId);
@@ -3108,11 +4607,29 @@ function resolveEffect(state, playerId, effect, context = {}) {
     case "sequence":
       for (const childEffect of effect.effects ?? []) {
         resolveEffect(state, playerId, childEffect, context);
+        if (childEffect.requiredMovedCountForFollowing !== undefined) {
+          const moved = childEffect.kind === "moveHandToZone"
+            ? context.lastEffectMovedFromHandCount ?? 0
+            : context.lastEffectMovedCardCount ?? 0;
+          if (moved < childEffect.requiredMovedCountForFollowing) break;
+        }
+        if (childEffect.requiredPlayedCountForFollowing !== undefined
+          && Number(context.lastEffectPlayedCount ?? 0) < Number(childEffect.requiredPlayedCountForFollowing)) break;
       }
       break;
     case "optional": {
-      const choice = context.choices?.[effect.choiceKey ?? "optionalEffect"];
+      const choiceKey = effect.choiceKey ?? "optionalEffect";
+      let choice = context.choices?.[choiceKey];
+      if (choice === undefined) {
+        resolveRuntimeChoices(state, playerId, effect, context, {
+          kind: "optionalEffect",
+          choiceKey,
+          canResolve: canStartOptionalEffect(state, playerId, effect.effect, context)
+        });
+        choice = context.choices?.[choiceKey];
+      }
       if (choice === false || (choice === undefined && effect.default === false)) return;
+      if (!canStartOptionalEffect(state, playerId, effect.effect, context)) return;
       resolveEffect(state, playerId, effect.effect, context);
       break;
     }
@@ -3135,7 +4652,9 @@ function resolveEffect(state, playerId, effect, context = {}) {
     }
     case "optionalChoiceUpgrade": {
       const choice = context.choices?.[effect.choiceKey ?? "optionalChoiceUpgrade"];
-      if (choice === false || (choice === undefined && effect.default === false)) {
+      if (choice === false
+        || (choice === undefined && effect.default === false)
+        || !canPayEffectCost(state, playerId, effect.costEffect)) {
         resolveEffect(state, playerId, effect.baseEffect, context);
         break;
       }
@@ -3180,13 +4699,17 @@ function resolveEffect(state, playerId, effect, context = {}) {
             return { index, choice };
           })
           .sort((a, b) => a.index - b.index);
+        assertAndRecordTurnChoices(player, effect, selectedChoices);
         for (const item of selectedChoices) resolveEffect(state, playerId, item.choice.effect, context);
         break;
       }
       const choiceKey = effect.choiceKey ?? "effectChoice";
-      const selected = context.choices?.[choiceKey] ?? effect.defaultIndex ?? 0;
-      const choice = effect.choices?.[selected] ?? effect.choices?.find((item) => item.id === selected);
+      const selected = context.choices?.[choiceKey] ?? defaultChoiceIndexForTurn(player, effect);
+      if (selected === -1 && effect.uniqueChoicesPerTurn) break;
+      const index = typeof selected === "number" ? selected : effect.choices?.findIndex((item) => item.id === selected);
+      const choice = effect.choices?.[index];
       assertRule(choice, "EFFECT_CHOICE", "Chosen effect branch does not exist.", { choiceKey, selected });
+      assertAndRecordTurnChoices(player, effect, [{ index, choice }]);
       resolveEffect(state, playerId, choice.effect, context);
       break;
     }
@@ -3194,6 +4717,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
       const choiceKey = effect.choiceKey ?? "effectChoices";
       const defaultCount = effect.defaultCount ?? effect.min ?? 1;
       const selected = context.choices?.[choiceKey] ?? [...Array(defaultCount).keys()];
+      const maximum = effectChoiceMaximum(state, playerId, effect, context);
       assertRule(Array.isArray(selected), "EFFECT_CHOICE", "ChooseN effects require an array of selected branches.", {
         choiceKey,
         selected
@@ -3202,10 +4726,10 @@ function resolveEffect(state, playerId, effect, context = {}) {
       assertRule(unique.size === selected.length, "EFFECT_CHOICE", "The same effect branch cannot be chosen more than once.", {
         selected
       });
-      assertRule(selected.length >= (effect.min ?? 0) && selected.length <= (effect.max ?? effect.choices?.length ?? selected.length), "EFFECT_CHOICE", "Invalid number of selected effect branches.", {
+      assertRule(selected.length >= (effect.min ?? 0) && selected.length <= maximum, "EFFECT_CHOICE", "Invalid number of selected effect branches.", {
         selected,
         min: effect.min,
-        max: effect.max
+        max: maximum
       });
       const selectedChoices = selected
         .map((choiceId) => {
@@ -3217,6 +4741,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
           return { index, choice };
         })
         .sort((a, b) => a.index - b.index);
+      assertAndRecordTurnChoices(player, effect, selectedChoices);
       for (const item of selectedChoices) {
         resolveEffect(state, playerId, item.choice.effect, context);
       }
@@ -3235,6 +4760,47 @@ function resolveEffect(state, playerId, effect, context = {}) {
     case "draw":
       drawCards(state, playerId, effect.amount ?? 1);
       break;
+    case "opponentMayDraw": {
+      const maximum = effect.amountIf?.condition && conditionMet(state, playerId, effect.amountIf.condition, context)
+        ? effect.amountIf.amount
+        : effect.amount ?? 1;
+      resolveRuntimeChoices(state, opponentOf(playerId), effect, context, {
+        kind: "opponentMayDraw",
+        cards: [],
+        ownerId: opponentOf(playerId),
+        initiatingPlayerId: playerId,
+        maximum
+      });
+      const rawChoice = context.choices?.[effect.choiceKey ?? "opponentDrawAmount"];
+      const amount = rawChoice === false ? 0 : rawChoice === true || rawChoice === undefined ? maximum : Number(rawChoice);
+      assertRule(Number.isInteger(amount) && amount >= 0 && amount <= maximum, "EFFECT_CHOICE", "Opponent draw choice is outside the allowed range.", {
+        amount,
+        maximum
+      });
+      drawCards(state, opponentOf(playerId), amount);
+      break;
+    }
+    case "revealHandCards": {
+      const revealed = revealHandCardsForEffect(state, playerId, effect, context);
+      context.lastRevealedHandCards = revealed;
+      context.lastRevealedHandCount = revealed.length;
+      break;
+    }
+    case "predictTopDeckRequiredEnergy": {
+      const prediction = Number(context.choices?.[effect.choiceKey ?? "requiredEnergyPrediction"] ?? 0);
+      assertRule(Number.isInteger(prediction) && prediction >= 0, "EFFECT_CHOICE", "Required-energy prediction must be a non-negative integer.", {
+        prediction
+      });
+      if (player.deck.length === 0) break;
+      const card = player.deck.shift();
+      recordCardsRevealedToOpponent(state, playerId, [card], { zone: "deck", source: effect.kind });
+      player.hand.push(card);
+      context.lastPredictedRequiredEnergy = prediction;
+      context.lastPredictionCard = card;
+      context.lastPredictionMatched = (defOf(state, card).requiredEnergy?.amount ?? 0) === prediction;
+      if (context.lastPredictionMatched) resolveEffect(state, playerId, effect.successEffect, context);
+      break;
+    }
     case "drawLastMovedFromHandCount":
       drawCards(state, playerId, context.lastEffectMovedFromHandCount ?? 0);
       break;
@@ -3255,58 +4821,69 @@ function resolveEffect(state, playerId, effect, context = {}) {
       drawCards(state, opponentOf(playerId), effect.amount ?? 1);
       break;
     case "gainBp":
-      context.permanent.bpDelta += effect.amount ?? 0;
+      applyBpModifier(state, context.permanent.controller, context.permanent, effect.amount ?? 0, "permanent", context);
       break;
     case "modifyBp": {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
+      const amount = resolvedEffectAmount(state, playerId, effect);
       for (const target of targets) {
-        if ((effect.amount ?? 0) < 0 && hasKeyword(state, target.permanent, "bpReductionProtection")) continue;
-        if ((effect.amount ?? 0) < 0
+        if (amount < 0 && (hasKeyword(state, target.permanent, "bpReductionProtection")
+          || abilityActionPreventedByAbility(state, target.playerId, target.permanent, "bpReduction", context))) continue;
+        if (amount < 0
           && target.lineName === LINES.FRONT
           && sourceIsOpponent(playerId, target.playerId)
           && topDef(state, target.permanent).moveToEnergyInsteadOnOpponentAbilityBpReduction
-          && getPlayer(state, target.playerId).energyLine.length < MAX_LINE_SIZE) {
+          && getPlayer(state, target.playerId).energyLine.length < lineCapacity(state, target.playerId, LINES.ENERGY)) {
           const moved = removeFromLine(getPlayer(state, target.playerId), target.lineName, target.index);
-          insertPermanent(state, target.playerId, LINES.ENERGY, moved);
+          insertPermanent(state, target.playerId, LINES.ENERGY, moved, undefined, {
+            operation: "move",
+            sourcePermanent: context.permanent,
+            choices: context.choices
+          });
           resolveCharacterMovedOutsideMovementPhase(state, target.playerId, moved, LINES.FRONT, LINES.ENERGY, context);
           state.log.push(`${target.playerId} moved ${topDef(state, moved).name} to the energy line instead of reducing its BP.`);
           continue;
         }
-        if (effect.duration === "turn" || effect.duration === "endOfTurn") {
-          target.permanent.bpModifiers.push({ amount: effect.amount ?? 0, expires: "endOfTurn" });
-        } else {
-          target.permanent.bpDelta += effect.amount ?? 0;
-        }
+        applyBpModifier(state, target.playerId, target.permanent, amount, effect.duration ?? "permanent", context);
       }
       break;
     }
     case "modifyBpLastPlayedPermanent": {
       for (const permanent of context.lastPlayedPermanents ?? (context.lastPlayedPermanent ? [context.lastPlayedPermanent] : [])) {
-        permanent.bpModifiers.push({
-          amount: effect.amount ?? 0,
-          expires: expirationFromDuration(effect.duration ?? "turn")
-        });
+        applyBpModifier(
+          state,
+          permanent.controller,
+          permanent,
+          effect.amount ?? 0,
+          effect.duration ?? "turn",
+          context
+        );
       }
       break;
     }
     case "modifyBpForHandReveal": {
       const matching = player.hand.filter((card) => cardMatchesFilter(state, card, effect.filter ?? {}));
-      const count = effect.uniqueNames
-        ? uniqueRevealedAndFieldNameCount(state, playerId, effect, context)
-        : context.choices?.[effect.choiceKey ?? "revealHandCount"] ?? matching.length;
+      let count;
+      if (effect.uniqueNames) {
+        count = uniqueRevealedAndFieldNameCount(state, playerId, effect, context);
+      } else {
+        const chosenCount = context.choices?.[effect.choiceKey ?? "revealHandCount"];
+        if (chosenCount !== undefined) {
+          count = chosenCount;
+        } else {
+          count = revealHandCardsForEffect(state, playerId, effect, context).length || matching.length;
+        }
+      }
       const amount = Number(effect.amountPerCard ?? 0) * count;
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
-      for (const target of targets) target.permanent.bpModifiers.push({ amount, expires: "endOfTurn" });
+      for (const target of targets) applyBpModifier(state, target.playerId, target.permanent, amount, "turn", context);
       break;
     }
     case "modifyBpForLastMovedUnderCards": {
       const amount = Number(effect.amountPerCard ?? 0) * (context.lastEffectMovedUnderCardCount ?? 0);
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       for (const target of targets) {
-        target.permanent.bpModifiers.push({
-          amount,
-          expires: expirationFromDuration(effect.duration ?? "turn")
-        });
+        applyBpModifier(state, target.playerId, target.permanent, amount, effect.duration ?? "turn", context);
       }
       break;
     }
@@ -3314,10 +4891,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
       const amount = Number(effect.amountPerCard ?? 0) * (context.lastEffectMovedFromHandCount ?? 0);
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       for (const target of targets) {
-        target.permanent.bpModifiers.push({
-          amount,
-          expires: expirationFromDuration(effect.duration ?? "turn")
-        });
+        applyBpModifier(state, target.playerId, target.permanent, amount, effect.duration ?? "turn", context);
       }
       break;
     }
@@ -3325,10 +4899,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
       const amount = Number(effect.amountPerCard ?? 0) * (context.lastEffectMovedCardCount ?? 0);
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       for (const target of targets) {
-        target.permanent.bpModifiers.push({
-          amount,
-          expires: expirationFromDuration(effect.duration ?? "turn")
-        });
+        applyBpModifier(state, target.playerId, target.permanent, amount, effect.duration ?? "turn", context);
       }
       break;
     }
@@ -3340,7 +4911,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
         bpMax
       }, context);
       mutateTargetsInReverse(targets, (target) => {
-        removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: true, sourcePlayer: playerId, choices: context.choices });
+        removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: true, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
       });
       break;
     }
@@ -3363,8 +4934,8 @@ function resolveEffect(state, playerId, effect, context = {}) {
     case "restTargets": {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       for (const target of targets) {
-        restPermanentByAbility(state, target.playerId, target.permanent, context);
-        if (effect.preventNextReady) {
+        const rested = restPermanentByAbility(state, target.playerId, target.permanent, context);
+        if (rested && effect.preventNextReady) {
           target.permanent.readyLocks = (target.permanent.readyLocks ?? 0) + 1;
         }
       }
@@ -3375,8 +4946,8 @@ function resolveEffect(state, playerId, effect, context = {}) {
       if (effect.optional && choice === false) break;
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       if (targets.length === 0) break;
-      for (const target of targets) restPermanentByAbility(state, target.playerId, target.permanent, context);
-      context.lastRestedTargets = targets;
+      context.lastRestedTargets = targets.filter((target) => restPermanentByAbility(state, target.playerId, target.permanent, context));
+      if (context.lastRestedTargets.length === 0) break;
       resolveEffect(state, playerId, effect.effect, context);
       break;
     }
@@ -3387,8 +4958,16 @@ function resolveEffect(state, playerId, effect, context = {}) {
       break;
     }
     case "payAp":
-      payAp(player, effect.amount ?? 1);
+      payAp(state, playerId, effect.amount ?? 1);
       break;
+    case "restrictCardUse": {
+      state.turnFlags ??= freshTurnFlags();
+      const restricted = state.turnFlags[playerId].restrictedCardUseSourceZones;
+      for (const zone of effect.sourceZones ?? [effect.sourceZone ?? "hand"]) {
+        if (!restricted.includes(zone)) restricted.push(zone);
+      }
+      break;
+    }
     case "grantKeyword": {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       for (const target of targets) {
@@ -3396,6 +4975,20 @@ function resolveEffect(state, playerId, effect, context = {}) {
           keyword: effect.keyword,
           value: effect.value ?? true,
           expires: expirationFromDuration(effect.duration)
+        });
+      }
+      break;
+    }
+    case "grantMandatoryBlockLink": {
+      const blockers = selectPermanentTargets(state, playerId, effect.blockerTarget, context);
+      const attackers = selectPermanentTargets(state, playerId, effect.attackerTarget, context);
+      const attacker = attackers[0]?.permanent;
+      if (!attacker) break;
+      for (const blocker of blockers) {
+        blocker.permanent.keywordModifiers.push({
+          keyword: "mustBlockAttacker",
+          value: attacker.pid,
+          expires: expirationFromDuration(effect.duration ?? "turn")
         });
       }
       break;
@@ -3417,22 +5010,24 @@ function resolveEffect(state, playerId, effect, context = {}) {
     case "sidelineSelf": {
       const location = findPermanentLocation(player, context.permanent.pid);
       if (location) {
-        removePermanentToZone(state, playerId, location.lineName, location.index, "sideline", { sidelined: true, sourcePlayer: playerId, choices: context.choices });
+        removePermanentToZone(state, playerId, location.lineName, location.index, "sideline", { sidelined: true, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
       }
       break;
     }
     case "sidelineTargets": {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       context.lastSidelinedTargetCount = targets.length;
+      context.lastSidelinedPermanent = targets[0]?.permanent;
+      context.lastSidelinedBp = targets[0] ? battlePower(state, targets[0].permanent) : 0;
       mutateTargetsInReverse(targets, (target) => {
-        removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: true, sourcePlayer: playerId, choices: context.choices });
+        removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: true, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
       });
       break;
     }
     case "sidelineTargetsAndDraw": {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       mutateTargetsInReverse(targets, (target) => {
-        removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: true, sourcePlayer: playerId, choices: context.choices });
+        removePermanentToZone(state, target.playerId, target.lineName, target.index, "sideline", { sidelined: true, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
       });
       drawCards(state, playerId, targets.length);
       break;
@@ -3440,7 +5035,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
     case "removeTargets": {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       mutateTargetsInReverse(targets, (target) => {
-        removePermanentToZone(state, target.playerId, target.lineName, target.index, "removal", { sidelined: false, sourcePlayer: playerId, choices: context.choices });
+        removePermanentToZone(state, target.playerId, target.lineName, target.index, "removal", { sidelined: false, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
       });
       break;
     }
@@ -3450,7 +5045,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
     case "returnTargetsToHand": {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       mutateTargetsInReverse(targets, (target) => {
-        removePermanentToZone(state, target.playerId, target.lineName, target.index, "hand", { sidelined: false, sourcePlayer: playerId, choices: context.choices });
+        removePermanentToZone(state, target.playerId, target.lineName, target.index, "hand", { sidelined: false, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
       });
       break;
     }
@@ -3458,17 +5053,18 @@ function resolveEffect(state, playerId, effect, context = {}) {
       const targets = selectPermanentTargets(state, playerId, effect.target ?? "self", context);
       if (targets.length > 0) {
         mutateTargetsInReverse(targets, (target) => {
-          removePermanentToZone(state, target.playerId, target.lineName, target.index, "hand", { sidelined: false, sourcePlayer: playerId, choices: context.choices });
+          removePermanentToZone(state, target.playerId, target.lineName, target.index, "hand", { sidelined: false, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
         });
       } else if (context.permanent) {
         const location = findPermanentLocation(player, context.permanent.pid);
-        if (location) removePermanentToZone(state, playerId, location.lineName, location.index, "hand", { sidelined: false, sourcePlayer: playerId, choices: context.choices });
+        if (location) removePermanentToZone(state, playerId, location.lineName, location.index, "hand", { sidelined: false, sourcePlayer: playerId, sourceDef: context.sourceDef, sourceKind: context.sourceKind, byAbility: true, choices: context.choices });
       }
       break;
     }
     case "damageOpponent":
       dealDamage(state, opponentOf(playerId), effect.amount ?? 1, {
         sourcePlayer: playerId,
+        sourcePermanent: context.permanent,
         lifeIndices: effect.lifeIndices
       });
       break;
@@ -3476,6 +5072,7 @@ function resolveEffect(state, playerId, effect, context = {}) {
       const damagedPlayerId = effect.player === "self" ? playerId : effect.player === "opponent" || !effect.player ? opponentOf(playerId) : effect.player;
       dealDamage(state, damagedPlayerId, effect.amount ?? 1, {
         sourcePlayer: playerId,
+        sourcePermanent: context.permanent,
         lifeIndices: effect.lifeIndices ?? context.choices?.[effect.lifeChoiceKey ?? "lifeIndices"],
         triggerChoices: context.choices?.triggerChoices
       });
@@ -3487,7 +5084,13 @@ function resolveEffect(state, playerId, effect, context = {}) {
     case "turnTopDeckFaceUp": {
       const owner = effect.player === "opponent" ? opponentOf(playerId) : playerId;
       const deck = getPlayer(state, owner).deck;
-      if (deck[0]) deck[0].faceUp = true;
+      if (deck[0]) {
+        deck[0].faceUp = true;
+        recordCardsRevealedToOpponent(state, owner, [deck[0]], {
+          zone: "deck",
+          source: effect.kind ?? "turnTopDeckFaceUp"
+        });
+      }
       break;
     }
     case "searchTopDeck":
@@ -3710,6 +5313,11 @@ function resolveEffect(state, playerId, effect, context = {}) {
       state.log.push(`${playerId} applied a replacement/use-restriction effect.`);
       break;
     case "revealOpponentHand":
+      recordCardsRevealedToPlayer(state, playerId, opponentOf(playerId), getOpponent(state, playerId).hand, {
+        zone: "hand",
+        source: effect.kind ?? "revealOpponentHand"
+      });
+      context.revealedOpponentHandCardUids = getOpponent(state, playerId).hand.map((card) => card.uid);
       state.log.push(`${opponentOf(playerId)} revealed ${getOpponent(state, playerId).hand.length} card(s) in hand.`);
       break;
     case "targetingModifier":
@@ -3805,6 +5413,64 @@ function resolveEffect(state, playerId, effect, context = {}) {
   }
 }
 
+function resolveStateBasedActions(state) {
+  if (state._resolvingStateBasedActions || state.winner) return;
+  state._resolvingStateBasedActions = true;
+  try {
+    let changed = true;
+    while (changed && !state.winner) {
+      changed = false;
+      for (const playerId of PLAYERS) {
+        const player = getPlayer(state, playerId);
+        for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
+          if (player[lineName].length > lineCapacity(state, playerId, lineName)) {
+            enforceLineCapacity(state, playerId, lineName);
+            changed = true;
+          }
+          for (let index = player[lineName].length - 1; index >= 0; index -= 1) {
+            const permanent = player[lineName][index];
+            if (!isCharacter(state, permanent) || battlePower(state, permanent) > 0) continue;
+            const name = topDef(state, permanent).name;
+            removePermanentToZone(state, playerId, lineName, index, "sideline", {
+              sidelined: true,
+              sourcePlayer: undefined,
+              stateBased: true
+            });
+            state.log.push(`${playerId}'s ${name} was sidelined because its BP was 0 or less.`);
+            changed = true;
+          }
+        }
+      }
+    }
+
+    if (!state.winner && !state._damageResolutionDepth) {
+      const defeated = PLAYERS.filter((playerId) => getPlayer(state, playerId).life.length === 0);
+      if (defeated.length === 1) {
+        state.winner = opponentOf(defeated[0]);
+        state.phase = PHASES.GAME_OVER;
+        state.log.push(`${state.winner} wins because ${defeated[0]} has no life remaining.`);
+      }
+    }
+  } finally {
+    delete state._resolvingStateBasedActions;
+  }
+}
+
+function resolveEffect(state, playerId, effect, context = {}) {
+  if (!effect || effect.kind === "none") return;
+  context.sourcePlayer ??= playerId;
+  context.byAbilityEffect = true;
+  const resolution = context.effectResolution ?? { depth: 0 };
+  context.effectResolution = resolution;
+  resolution.depth += 1;
+  try {
+    return resolveEffectBody(state, playerId, effect, context);
+  } finally {
+    resolution.depth -= 1;
+    if (resolution.depth === 0) resolveStateBasedActions(state);
+  }
+}
+
 function sourcePermanent(source) {
   if (!source) return undefined;
   return source.cards ? source : source.permanent;
@@ -3839,7 +5505,7 @@ function effectiveAbilityCost(state, playerId, source, ability) {
   return cost;
 }
 
-function payAbilityCost(state, playerId, source, ability) {
+function payAbilityCost(state, playerId, source, ability, choices = {}) {
   const player = getPlayer(state, playerId);
   const cost = effectiveAbilityCost(state, playerId, source, ability);
   const permanent = sourcePermanent(source);
@@ -3852,13 +5518,24 @@ function payAbilityCost(state, playerId, source, ability) {
   }
 
   if (cost.ap) {
-    payAp(player, cost.ap);
+    payAp(state, playerId, cost.ap);
     flagApPaidAbilityUsed(state, playerId);
   }
 
   if (cost.discardFromHand) {
-    assertRule(player.hand.length >= cost.discardFromHand, "ABILITY_COST", "Not enough cards in hand to pay this cost.");
-    for (const card of player.hand.splice(0, cost.discardFromHand)) {
+    const eligibleIndexes = player.hand
+      .map((card, index) => ({ card, index }))
+      .filter(({ card }) => !cost.discardFromHandFilter || cardMatchesFilter(state, card, cost.discardFromHandFilter))
+      .map(({ index }) => index);
+    assertRule(eligibleIndexes.length >= cost.discardFromHand, "ABILITY_COST", "Not enough matching cards in hand to pay this cost.");
+    const requested = choices[cost.discardChoiceKey ?? "abilityDiscardHandIndexes"];
+    const selectedIndexes = (Array.isArray(requested) ? requested : eligibleIndexes)
+      .filter((index, position, indexes) => eligibleIndexes.includes(index) && indexes.indexOf(index) === position)
+      .slice(0, cost.discardFromHand)
+      .sort((a, b) => b - a);
+    assertRule(selectedIndexes.length === cost.discardFromHand, "ABILITY_COST", "Ability discard choices do not satisfy the cost.");
+    for (const index of selectedIndexes) {
+      const [card] = player.hand.splice(index, 1);
       placeHandCardInZone(state, playerId, player, "sideline", card, {}, { sourceDef, ability });
     }
   }
@@ -3878,7 +5555,12 @@ function canPayAbilityCost(state, playerId, source, ability) {
   if ((cost.restSelf || cost.sidelineSelf) && !permanent) return false;
   if (cost.restSelf && permanent.rested) return false;
   if (cost.ap && activeAp(player) < cost.ap) return false;
-  if (cost.discardFromHand && player.hand.length < cost.discardFromHand) return false;
+  if (cost.discardFromHand) {
+    const eligibleCount = cost.discardFromHandFilter
+      ? player.hand.filter((card) => cardMatchesFilter(state, card, cost.discardFromHandFilter)).length
+      : player.hand.length;
+    if (eligibleCount < cost.discardFromHand) return false;
+  }
   if (cost.sidelineSelf && !findPermanentLocation(player, permanent.pid)) return false;
   return true;
 }
@@ -3950,7 +5632,6 @@ function abilityConditionsMet(state, playerId, source, ability, context = {}) {
 
 function canActivateMainAbility(state, playerId, permanent, ability) {
   if (ability.timing !== TIMINGS.ACTIVATE_MAIN) return false;
-  if (hasKeyword(state, permanent, "lostAbilities")) return false;
   const player = getPlayer(state, playerId);
   if (!abilityConditionsMet(state, playerId, permanent, ability)) return false;
   if (ability.oncePerTurn && permanent.usedOncePerTurn.includes(ability.id)) return false;
@@ -3973,7 +5654,7 @@ function canActivateMainZoneAbility(state, playerId, zoneName, card, ability) {
 function takeTargetingModifierForAbility(state, playerId, sourceDef, ability) {
   const modifier = (state.continuousEffects ?? []).find((effect) => {
     if (effect.kind !== "targetingModifier" || effect.controller !== playerId) return false;
-    if (effect.sourceName && !sameText(sourceDef.name, effect.sourceName)) return false;
+    if (effect.sourceName && !cardDefHasName(sourceDef, effect.sourceName)) return false;
     if (effect.timing && ability.timing !== effect.timing) return false;
     return true;
   });
@@ -3993,6 +5674,8 @@ function resolveZoneCardAbilities(state, playerId, zoneName, card, timing, conte
     if (!canPayAbilityCost(state, playerId, source, ability)) continue;
 
     payAbilityCost(state, playerId, source, ability);
+    if (ability.oncePerTurn && turnKey) player.usedTurnAbilityKeys.push(turnKey);
+    if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
     resolveEffect(state, playerId, ability.effect, {
       ...context,
       zone: zoneName,
@@ -4000,8 +5683,6 @@ function resolveZoneCardAbilities(state, playerId, zoneName, card, timing, conte
       ability,
       sourceDef: defOf(state, card)
     });
-    if (ability.oncePerTurn && turnKey) player.usedTurnAbilityKeys.push(turnKey);
-    if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
   }
 }
 
@@ -4010,14 +5691,13 @@ function resolvePermanentAbilities(state, playerId, permanent, timing, context =
   const player = getPlayer(state, playerId);
   for (const ability of abilitiesOfPermanent(state, permanent)) {
     if (ability.timing !== timing) continue;
-    if (hasKeyword(state, permanent, "lostAbilities")) continue;
     if (!abilityConditionsMet(state, playerId, permanent, ability, context)) continue;
     if (ability.oncePerTurn && permanent.usedOncePerTurn.includes(ability.id)) continue;
     if (ability.oncePerTurnKey && player.usedTurnAbilityKeys.includes(ability.oncePerTurnKey)) continue;
     if (ability.cost) payAbilityCost(state, playerId, permanent, ability);
-    resolveEffect(state, playerId, ability.effect, { ...context, permanent, ability, sourceDef });
     if (ability.oncePerTurn) permanent.usedOncePerTurn.push(ability.id);
     if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
+    resolveEffect(state, playerId, ability.effect, { ...context, permanent, ability, sourceDef });
   }
 }
 
@@ -4029,9 +5709,9 @@ function resolveRaidedAbilities(state, playerId, permanent, raidedDef, context =
     if (ability.oncePerTurn && permanent.usedOncePerTurn.includes(ability.id)) continue;
     if (ability.oncePerTurnKey && player.usedTurnAbilityKeys.includes(ability.oncePerTurnKey)) continue;
     if (ability.cost) payAbilityCost(state, playerId, permanent, ability);
-    resolveEffect(state, playerId, ability.effect, { ...context, permanent, ability, sourceDef: raidedDef });
     if (ability.oncePerTurn) permanent.usedOncePerTurn.push(ability.id);
     if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
+    resolveEffect(state, playerId, ability.effect, { ...context, permanent, ability, sourceDef: raidedDef });
   }
 }
 
@@ -4053,7 +5733,7 @@ function resolveLifeToSidelineNoTriggerAbilities(state, playerId, cardRef) {
 }
 
 function resolveWhenUsingEffect(state, playerId, cardDef, cardRef, choices = {}) {
-  const context = { card: cardRef, choices, sourceDef: cardDef };
+  const context = { card: cardRef, choices, sourceDef: cardDef, sourceZone: "hand" };
   if (cardDef.whenUsingEffect) resolveEffect(state, playerId, cardDef.whenUsingEffect, context);
   return context;
 }
@@ -4068,7 +5748,7 @@ function playCard(state, action) {
   const useOptions = { sourceZone: "hand" };
   assertCanUseCard(state, action.player, cardDef, useOptions);
   const apCost = apCostForCardUse(state, action.player, cardDef, useOptions);
-  payAp(player, apCost);
+  payAp(state, action.player, apCost);
   payUseRestrictionCosts(state, action.player, cardDef, action.choices);
   consumeRequiredEnergyReductions(state, action.player, cardDef, useOptions);
   consumeApCostReductions(state, action.player, cardDef, useOptions);
@@ -4078,7 +5758,12 @@ function playCard(state, action) {
 
   if (cardDef.type === CARD_TYPES.EVENT) {
     flagEventUsed(state, action.player);
-    resolveEffect(state, action.player, cardDef.eventEffect, { card: cardRef, choices: action.choices, sourceDef: cardDef });
+    resolveEffect(state, action.player, cardDef.eventEffect, {
+      card: cardRef,
+      choices: action.choices,
+      sourceDef: cardDef,
+      sourceZone: "hand"
+    });
     placeCardInZone(state, player, "sideline", cardRef, { fromHandUse: true });
     state.log.push(`${action.player} used event ${cardDef.name}.`);
     return;
@@ -4089,6 +5774,10 @@ function playCard(state, action) {
   } else {
     assertRule(action.destination === LINES.FRONT || action.destination === LINES.ENERGY, "CHARACTER_LINE", "Character cards must be played to a field line.");
   }
+  assertRule(cardCanEnterLine(state, action.player, cardDef, action.destination, { operation: "play" }), "LINE_RESTRICTION", "This card cannot be played to that line.", {
+    card: cardDef.id,
+    destination: action.destination
+  });
 
   const entersActive = cardDef.entersActive
     || (cardDef.entersActiveOnUseEffect && (whenUsingContext.lastEffectMovedFromHandCount ?? 0) > 0)
@@ -4096,7 +5785,10 @@ function playCard(state, action) {
       ? conditionMet(state, action.player, cardDef.entersActiveCondition, { cardDef, sourceZone: action.from ?? "hand" })
       : false);
   const permanent = createPermanent(state, action.player, cardRef, !entersActive);
-  insertPermanent(state, action.player, action.destination, permanent, action.replaceIndex);
+  insertPermanent(state, action.player, action.destination, permanent, action.replaceIndex, {
+    operation: "play",
+    choices: action.choices
+  });
   flagCharacterPlayed(state, action.player, cardDef);
   resolvePermanentAbilities(state, action.player, permanent, TIMINGS.WHEN_PLAYED, { permanent, choices: action.choices });
   state.log.push(`${action.player} played ${cardDef.name} to ${action.destination}.`);
@@ -4116,30 +5808,47 @@ function performRaid(state, action) {
   assertRule(target, "RAID_TARGET", "Raid target does not exist.");
   assertRule(isCharacter(state, target), "RAID_TARGET", "Raid target must be a character.");
   assertRule(!topDef(state, target).raid, "RAID_TARGET", "Raid target must not possess Raid.");
-  assertRule(matchesRaidRequirement(state, cardDef.raid, target), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
+  assertRule(matchesRaidRequirement(state, cardDef.raid, target, { raidCardDef: cardDef, sourceKind: "cardUse" }), "RAID_TARGET", "Raid target does not match this card's Raid requirement.");
 
   const useOptions = { sourceZone: "hand", performingRaid: true };
   assertCanUseCard(state, action.player, cardDef, useOptions);
   const apCost = apCostForCardUse(state, action.player, cardDef, useOptions);
-  payAp(player, apCost);
+  payAp(state, action.player, apCost);
   consumeRequiredEnergyReductions(state, action.player, cardDef, useOptions);
   consumeApCostReductions(state, action.player, cardDef, useOptions);
   player.hand.splice(action.handIndex, 1);
   flagCardUsedFromHand(state, action.player, cardDef);
   resolveWhenUsingEffect(state, action.player, cardDef, cardRef, action.choices);
   const raidedDef = topDef(state, target);
+  resetPermanentForRaid(target);
   target.cards.push(cardRef);
   readyPermanent(target);
 
   if (action.targetLine === LINES.ENERGY && action.moveToFront) {
+    assertRule(permanentCanEnterLine(state, action.player, target, LINES.FRONT, { operation: "move" }), "LINE_RESTRICTION", "This raided character cannot move to the front line.");
     const moved = removeFromLine(player, LINES.ENERGY, action.targetIndex);
-    insertPermanent(state, action.player, LINES.FRONT, moved, action.replaceIndex);
+    insertPermanent(state, action.player, LINES.FRONT, moved, action.replaceIndex, {
+      operation: "move",
+      sourcePermanent: moved,
+      choices: action.choices
+    });
     resolveCharacterMovedOutsideMovementPhase(state, action.player, moved, LINES.ENERGY, LINES.FRONT, { choices: action.choices });
   }
 
   resolvePermanentAbilities(state, action.player, target, TIMINGS.WHEN_PLAYED, { permanent: target, raid: true, choices: action.choices });
   resolveRaidedAbilities(state, action.player, target, raidedDef, { permanent: target, raid: true, choices: action.choices });
   state.log.push(`${action.player} performed Raid with ${cardDef.name}.`);
+}
+
+function addLegalLinePlacementActions(state, playerId, lineName, baseAction, actions) {
+  const line = lineOf(getPlayer(state, playerId), lineName);
+  const capacity = lineCapacity(state, playerId, lineName);
+  if (line.length < capacity) {
+    actions.push(baseAction);
+    return;
+  }
+  if (capacity <= 0 || line.length === 0) return;
+  line.forEach((_, replaceIndex) => actions.push({ ...baseAction, replaceIndex }));
 }
 
 function movementRestricted(state, playerId, move) {
@@ -4156,8 +5865,12 @@ function moveCharacters(state, action) {
   const player = getPlayer(state, action.player);
   assertRule(state.activePlayer === action.player && state.phase === PHASES.MOVEMENT, "PHASE", "Characters move during your movement phase.");
   assertRule(Array.isArray(action.moves), "MOVE", "Movement action requires a moves array.");
+  state.turnFlags ??= freshTurnFlags();
+  assertRule(!state.turnFlags[action.player].movementActionUsed, "MOVE_COMPLETE", "Characters can only be moved once during a movement phase.");
+  assertRule(action.moves.length > 0, "MOVE", "At least one character must be selected for movement.");
 
   const sourceKeys = new Set();
+  const sourcePermanentIds = new Set();
   const selected = action.moves.map((move) => {
     const sourceLine = lineOf(player, move.from);
     const permanent = sourceLine[move.index];
@@ -4167,6 +5880,7 @@ function moveCharacters(state, action) {
     assertRule(!movementRestricted(state, action.player, move), "MOVE_RESTRICTED", "This movement direction is currently restricted.", move);
     assertRule(move.to === LINES.FRONT || move.to === LINES.ENERGY, "MOVE_DESTINATION", "Unknown movement destination.", move);
     assertRule(move.from !== move.to, "MOVE_DESTINATION", "Movement must change lines.", move);
+    assertRule(permanentCanEnterLine(state, action.player, permanent, move.to, { operation: "movementPhase" }), "LINE_RESTRICTION", "This character cannot move to that line during the movement phase.", move);
 
     if (move.from === LINES.FRONT) {
       assertRule(hasKeyword(state, permanent, "step"), "STEP", "Only characters with Step can move from front line to energy line.");
@@ -4174,14 +5888,55 @@ function moveCharacters(state, action) {
 
     const key = `${move.from}:${move.index}`;
     assertRule(!sourceKeys.has(key), "MOVE_DUPLICATE", "A character cannot be moved twice in one movement action.", move);
+    assertRule(!sourcePermanentIds.has(permanent.pid), "MOVE_DUPLICATE", "A character cannot be moved twice in one movement action.", move);
     sourceKeys.add(key);
+    sourcePermanentIds.add(permanent.pid);
     return { ...move, permanent };
   });
+
+  const replacements = action.movementReplacements ?? [];
+  assertRule(Array.isArray(replacements), "MOVE_REPLACEMENT", "Movement replacements must be an array.");
+  const replacementIds = new Set();
+  for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
+    const outgoing = selected.filter((move) => move.from === lineName).length;
+    const incoming = selected.filter((move) => move.to === lineName).length;
+    const overflow = Math.max(0, player[lineName].length - outgoing + incoming - lineCapacity(state, action.player, lineName));
+    const lineReplacements = replacements.filter((replacement) => replacement.line === lineName || replacement.lineName === lineName);
+    assertRule(lineReplacements.length === overflow, "MOVE_REPLACEMENT", "Movement requires one existing destination-line card for each overflow slot.", {
+      lineName,
+      overflow,
+      selected: lineReplacements.length
+    });
+    for (const replacement of lineReplacements) {
+      const permanentId = replacement.permanentId
+        ?? player[lineName][overflowChoiceIndex(player[lineName], replacement)]?.pid;
+      const permanent = player[lineName].find((candidate) => candidate.pid === permanentId);
+      assertRule(permanent && !sourcePermanentIds.has(permanent.pid), "MOVE_REPLACEMENT", "A movement replacement must be an existing destination-line card that is not moving.", {
+        lineName,
+        permanentId
+      });
+      assertRule(!replacementIds.has(permanent.pid), "MOVE_REPLACEMENT", "The same card cannot be removed twice for movement overflow.", {
+        permanentId
+      });
+      replacementIds.add(permanent.pid);
+    }
+  }
+
+  for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
+    const removals = [...replacementIds]
+      .map((permanentId) => player[lineName].findIndex((permanent) => permanent.pid === permanentId))
+      .filter((index) => index !== -1)
+      .sort((a, b) => b - a);
+    for (const index of removals) {
+      removePermanentToZone(state, action.player, lineName, index, "removal", { sidelined: false });
+    }
+  }
 
   for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
     const removals = selected
       .filter((move) => move.from === lineName)
-      .map((move) => move.index)
+      .map((move) => player[lineName].findIndex((permanent) => permanent.pid === move.permanent.pid))
+      .filter((index) => index !== -1)
       .sort((a, b) => b - a);
     for (const index of removals) {
       lineOf(player, lineName).splice(index, 1);
@@ -4189,9 +5944,13 @@ function moveCharacters(state, action) {
   }
 
   for (const move of selected) {
-    insertPermanent(state, action.player, move.to, move.permanent, move.replaceIndex);
+    insertPermanent(state, action.player, move.to, move.permanent, undefined, {
+      operation: "movementPhase",
+      choices: action.choices
+    });
     flagCharacterMoved(state, action.player, move.permanent);
   }
+  state.turnFlags[action.player].movementActionUsed = true;
   state.log.push(`${action.player} moved ${selected.length} character(s).`);
 }
 
@@ -4222,17 +5981,19 @@ function activateMainAbility(state, action) {
       assertRule(!player.usedTurnAbilityKeys.includes(ability.oncePerTurnKey), "ONCE_PER_TURN", "This ability has already been used this turn.");
     }
 
-    payAbilityCost(state, action.player, source, ability);
+    payAbilityCost(state, action.player, source, ability, action.choices);
+    if (ability.oncePerTurn && turnKey) player.usedTurnAbilityKeys.push(turnKey);
+    if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
     resolveEffect(state, action.player, ability.effect, {
       zone: action.zone,
       zoneIndex,
       card,
       ability,
+      sourceDef,
+      sourceZone: action.zone,
       targetingModifier: takeTargetingModifierForAbility(state, action.player, sourceDef, ability),
       choices: action.choices
     });
-    if (ability.oncePerTurn && turnKey) player.usedTurnAbilityKeys.push(turnKey);
-    if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
     resolveFieldPermanentAbilities(state, opponentOf(action.player), TIMINGS.WHEN_OPPONENT_ACTIVATE_MAIN_ABILITY, {
       activatedPlayer: action.player,
       activatedAbility: ability,
@@ -4254,7 +6015,9 @@ function activateMainAbility(state, action) {
     assertRule(!player.usedTurnAbilityKeys.includes(ability.oncePerTurnKey), "ONCE_PER_TURN", "This ability has already been used this turn.");
   }
 
-  payAbilityCost(state, action.player, permanent, ability);
+  payAbilityCost(state, action.player, permanent, ability, action.choices);
+  if (ability.oncePerTurn) permanent.usedOncePerTurn.push(ability.id);
+  if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
   resolveEffect(state, action.player, ability.effect, {
     permanent,
     ability,
@@ -4262,8 +6025,6 @@ function activateMainAbility(state, action) {
     targetingModifier: takeTargetingModifierForAbility(state, action.player, sourceDef, ability),
     choices: action.choices
   });
-  if (ability.oncePerTurn) permanent.usedOncePerTurn.push(ability.id);
-  if (ability.oncePerTurnKey) player.usedTurnAbilityKeys.push(ability.oncePerTurnKey);
   resolveFieldPermanentAbilities(state, opponentOf(action.player), TIMINGS.WHEN_OPPONENT_ACTIVATE_MAIN_ABILITY, {
     activatedPlayer: action.player,
     activatedAbility: ability,
@@ -4273,7 +6034,7 @@ function activateMainAbility(state, action) {
 
 function battlePower(state, permanent) {
   const temporary = (permanent.bpModifiers ?? []).reduce((total, modifier) => total + modifier.amount, 0);
-  const staticPower = (topDef(state, permanent).staticModifiers ?? [])
+  const staticPower = (baseAbilitiesLost(permanent) ? [] : topDef(state, permanent).staticModifiers ?? [])
     .filter((modifier) => staticModifierApplies(state, permanent, modifier))
     .reduce((total, modifier) => total + staticModifierAmount(state, permanent, modifier), 0);
   const fieldPower = staticFieldModifiersForPermanent(state, permanent)
@@ -4286,6 +6047,7 @@ function staticFieldModifiersForPermanent(state, permanent) {
   for (const playerId of PLAYERS) {
     const player = getPlayer(state, playerId);
     for (const source of [...player.frontLine, ...player.energyLine]) {
+      if (baseAbilitiesLost(source)) continue;
       for (const modifier of topDef(state, source).staticFieldModifiers ?? []) {
         if (!staticModifierApplies(state, source, modifier)) continue;
         if (!staticFieldModifierTargetsPermanent(state, source, permanent, modifier.target ?? {})) continue;
@@ -4301,6 +6063,7 @@ function staticFieldKeywordModifiersForPermanent(state, permanent) {
   for (const playerId of PLAYERS) {
     const player = getPlayer(state, playerId);
     for (const source of [...player.frontLine, ...player.energyLine]) {
+      if (baseAbilitiesLost(source)) continue;
       for (const modifier of topDef(state, source).staticFieldKeywordModifiers ?? []) {
         if (!staticModifierApplies(state, source, modifier)) continue;
         if (!staticFieldModifierTargetsPermanent(state, source, permanent, modifier.target ?? {})) continue;
@@ -4415,12 +6178,12 @@ function clearEndOfAttackModifiers(permanent) {
   permanent.bpModifiers = (permanent.bpModifiers ?? []).filter((modifier) => modifier.expires !== "endOfAttack");
 }
 
-function resolveAttackPhaseTiming(state, timing) {
+function resolveAttackPhaseTiming(state, timing, choices) {
   for (const playerId of PLAYERS) {
-    resolveFieldPermanentAbilities(state, playerId, timing, { activePlayer: state.activePlayer });
+    resolveFieldPermanentAbilities(state, playerId, timing, { activePlayer: state.activePlayer, choices });
     if (timing === TIMINGS.START_OF_ATTACK_PHASE && playerId === state.activePlayer) {
       for (const card of [...getPlayer(state, playerId).hand]) {
-        resolveZoneCardAbilities(state, playerId, "hand", card, timing, { activePlayer: state.activePlayer });
+        resolveZoneCardAbilities(state, playerId, "hand", card, timing, { activePlayer: state.activePlayer, choices });
       }
     }
   }
@@ -4447,7 +6210,8 @@ function impactDamageAmount(state, attacker, defender) {
   const impact = keywordValue(state, attacker, "impact", 0);
   const impactPlus = keywordValue(state, attacker, "impactPlus", 0);
   if (impact === 0 && impactPlus === 0) return 0;
-  return Math.max(1, impact) + impactPlus;
+  if (impact === 0) return Math.max(1, impactPlus);
+  return impact + impactPlus;
 }
 
 function normalizeLifeIndices(player, amount, lifeIndices) {
@@ -4467,6 +6231,7 @@ function triggerReplacementApplies(state, playerId, replacement, trigger, trigge
   if (replacement.filter && !cardDefMatchesFilter(triggerCardDef, replacement.filter)) return false;
   if (replacement.requiredEnergyFulfilled && !hasRequiredEnergy(state, playerId, triggerCardDef)) return false;
   if (replacement.during === "opponentTurn" && state.activePlayer !== opponentOf(playerId)) return false;
+  if (replacement.effect && !canPayEffectCost(state, playerId, replacement.effect)) return false;
   return true;
 }
 
@@ -4476,6 +6241,7 @@ function takeTriggerReplacement(state, playerId, trigger, triggerCardDef, choice
   const candidates = [];
   for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
     lineOf(player, lineName).forEach((permanent, index) => {
+      if (baseAbilitiesLost(permanent)) return;
       const cardDef = topDef(state, permanent);
       for (const replacement of cardDef.triggerReplacements ?? []) {
         if (replacement.line && replacement.line !== lineName) continue;
@@ -4489,13 +6255,101 @@ function takeTriggerReplacement(state, playerId, trigger, triggerCardDef, choice
   return selected?.replacement;
 }
 
+function resolveRaidTrigger(state, playerId, cardRef, choices = {}) {
+  const player = getPlayer(state, playerId);
+  const cardDef = defOf(state, cardRef);
+  const useOptions = { sourceZone: "life", performingRaid: true, sourceKind: "trigger" };
+  const raidTargets = cardDef.type === CARD_TYPES.CHARACTER
+    && cardDef.raid
+    && hasRequiredEnergy(state, playerId, cardDef, useOptions)
+    && raidUseConditionMet(state, playerId, cardDef, useOptions)
+    ? raidTargetsForCard(state, playerId, cardDef, { sourceKind: "trigger" })
+    : [];
+  const resolutionContext = {
+    choices: { ...(choices ?? {}) },
+    card: cardRef,
+    sourceDef: cardDef,
+    sourceKind: "trigger"
+  };
+  resolveRuntimeChoices(state, playerId, { kind: "raidTrigger" }, resolutionContext, {
+    kind: "raidTrigger",
+    cards: [cardRef],
+    ownerId: playerId,
+    raidTargets: raidTargets.map((target) => ({
+      player: playerId,
+      line: target.lineName,
+      index: target.index,
+      permanentId: player[target.lineName]?.[target.index]?.pid
+    }))
+  });
+  choices = resolutionContext.choices;
+  const raidTarget = choices?.raidTarget
+    ?? raidTargets[0];
+  const canRaid = choices?.performRaid !== false
+    && cardDef.type === CARD_TYPES.CHARACTER
+    && Boolean(cardDef.raid)
+    && hasRequiredEnergy(state, playerId, cardDef, useOptions)
+    && raidUseConditionMet(state, playerId, cardDef, useOptions)
+    && Boolean(raidTarget);
+
+  if (!canRaid) {
+    player.hand.push(cardRef);
+    return;
+  }
+
+  const lineName = raidTarget.lineName ?? raidTarget.line ?? LINES.FRONT;
+  const target = lineOf(player, lineName)[raidTarget.index];
+  assertRule(target && isCharacter(state, target), "RAID_TARGET", "Raid-trigger target must be a character.");
+  assertRule(!topDef(state, target).raid, "RAID_TARGET", "Raid-trigger target must not possess Raid.");
+  assertRule(matchesRaidRequirement(state, cardDef.raid, target, {
+    raidCardDef: cardDef,
+    sourceKind: "trigger"
+  }), "RAID_TARGET", "Raid-trigger target does not match this card's Raid requirement.");
+
+  const raidedDef = topDef(state, target);
+  resetPermanentForRaid(target);
+  target.cards.push(cardRef);
+  readyPermanent(target);
+
+  const moveToFront = choices?.moveToFront
+    ?? (player.frontLine.length < lineCapacity(state, playerId, LINES.FRONT));
+  if (lineName === LINES.ENERGY && moveToFront) {
+    assertRule(permanentCanEnterLine(state, playerId, target, LINES.FRONT, { operation: "move" }), "LINE_RESTRICTION", "This raided character cannot move to the front line.");
+    const location = findPermanentLocation(player, target.pid);
+    if (location?.lineName === LINES.ENERGY) {
+      const moved = removeFromLine(player, LINES.ENERGY, location.index);
+      insertPermanent(state, playerId, LINES.FRONT, moved, choices?.replaceIndex, {
+        operation: "move",
+        sourcePermanent: moved,
+        choices
+      });
+      resolveCharacterMovedOutsideMovementPhase(state, playerId, moved, LINES.ENERGY, LINES.FRONT, { choices });
+    }
+  }
+
+  resolvePermanentAbilities(state, playerId, target, TIMINGS.WHEN_PLAYED, {
+    permanent: target,
+    raid: true,
+    choices,
+    playedByAbility: true,
+    sourceKind: "trigger"
+  });
+  resolveRaidedAbilities(state, playerId, target, raidedDef, {
+    permanent: target,
+    raid: true,
+    choices,
+    sourceKind: "trigger"
+  });
+  state.log.push(`${playerId} performed Raid with ${cardDef.name} from its Raid trigger.`);
+}
+
 function resolveTrigger(state, playerId, cardRef, triggerChoice = true) {
   const player = getPlayer(state, playerId);
   const def = defOf(state, cardRef);
-  const trigger = def.trigger;
+  const printedTrigger = def.trigger;
   cardRef.faceUp = true;
 
-  if (!trigger || trigger.type === TRIGGER_TYPES.NONE || triggerChoice === false) {
+  if (!printedTrigger || printedTrigger.type === TRIGGER_TYPES.NONE || triggerChoice === false) {
     placeCardInZone(state, player, "sideline", cardRef);
     if (!hasTriggerAbility(def)) {
       resolveLifeToSidelineNoTriggerAbilities(state, playerId, cardRef);
@@ -4505,10 +6359,15 @@ function resolveTrigger(state, playerId, cardRef, triggerChoice = true) {
 
   flagTriggerAbilityActivated(state, playerId);
   const choices = typeof triggerChoice === "object" ? triggerChoice.choices ?? triggerChoice : undefined;
+  const requestedSelfTrigger = choices?.selfTriggerType;
+  const triggerOptions = [printedTrigger, ...(def.selfTriggerAlternatives ?? [])];
+  const trigger = requestedSelfTrigger
+    ? triggerOptions.find((candidate) => candidate.type === requestedSelfTrigger) ?? printedTrigger
+    : printedTrigger;
   const replacement = takeTriggerReplacement(state, playerId, trigger, def, choices);
   if (replacement) {
     placeCardInZone(state, player, "sideline", cardRef);
-    resolveEffect(state, playerId, replacement.effect, { card: cardRef, choices });
+      resolveEffect(state, playerId, replacement.effect, { card: cardRef, choices, sourceDef: def, sourceKind: "trigger" });
     return;
   }
 
@@ -4518,12 +6377,12 @@ function resolveTrigger(state, playerId, cardRef, triggerChoice = true) {
       break;
     case TRIGGER_TYPES.DRAW:
       placeCardInZone(state, player, "sideline", cardRef);
-      resolveEffect(state, playerId, { kind: "draw", amount: trigger.amount ?? 1 }, { card: cardRef });
+      resolveEffect(state, playerId, { kind: "draw", amount: trigger.amount ?? 1 }, { card: cardRef, sourceDef: def, sourceKind: "trigger" });
       break;
     case TRIGGER_TYPES.ACTIVE:
       placeCardInZone(state, player, "sideline", cardRef);
       if (trigger.effect) {
-        resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices });
+        resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices, sourceDef: def, sourceKind: "trigger" });
       } else {
         for (const permanent of [...player.frontLine, ...player.energyLine]) {
           readyPermanent(permanent);
@@ -4531,16 +6390,16 @@ function resolveTrigger(state, playerId, cardRef, triggerChoice = true) {
       }
       break;
     case "raid":
-      player.hand.push(cardRef);
+      resolveRaidTrigger(state, playerId, cardRef, choices);
       break;
     default:
       placeCardInZone(state, player, "sideline", cardRef);
-      resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices });
+      resolveEffect(state, playerId, trigger.effect, { card: cardRef, choices, sourceDef: def, sourceKind: "trigger" });
       break;
   }
 }
 
-function dealDamage(state, damagedPlayerId, amount, { sourcePlayer, lifeIndices, triggerChoices = [] } = {}) {
+function dealDamage(state, damagedPlayerId, amount, { sourcePlayer, sourcePermanent, lifeIndices, triggerChoices = [] } = {}) {
   const damagedPlayer = getPlayer(state, damagedPlayerId);
   const chosen = normalizeLifeIndices(damagedPlayer, amount, lifeIndices);
   const unique = new Set(chosen);
@@ -4560,7 +6419,23 @@ function dealDamage(state, damagedPlayerId, amount, { sourcePlayer, lifeIndices,
     damagedPlayer.life.splice(index, 1);
   }
 
-  selectedCards.forEach((card, idx) => resolveTrigger(state, damagedPlayerId, card, triggerChoices[idx] ?? state.settings.autoActivateTriggers));
+  recordCardsRevealedToOpponent(state, damagedPlayerId, selectedCards, {
+    zone: "life",
+    source: "damage"
+  });
+  state._damageResolutionDepth = (state._damageResolutionDepth ?? 0) + 1;
+  try {
+    selectedCards.forEach((card, idx) => {
+      const triggerType = defOf(state, card).trigger?.type;
+      const suppressed = sourcePermanent
+        && ((triggerType === TRIGGER_TYPES.DRAW && hasKeyword(state, sourcePermanent, "suppressDrawTriggersOnDamage"))
+          || (triggerType === TRIGGER_TYPES.ACTIVE && hasKeyword(state, sourcePermanent, "suppressActiveTriggersOnDamage")));
+      resolveTrigger(state, damagedPlayerId, card, suppressed ? false : triggerChoices[idx] ?? state.settings.autoActivateTriggers);
+    });
+  } finally {
+    state._damageResolutionDepth -= 1;
+    if (state._damageResolutionDepth === 0) delete state._damageResolutionDepth;
+  }
   state.log.push(`${damagedPlayerId} took ${selectedCards.length} damage.`);
 
   if (damagedPlayer.life.length === 0 && !state.winner) {
@@ -4570,34 +6445,115 @@ function dealDamage(state, damagedPlayerId, amount, { sourcePlayer, lifeIndices,
   }
 }
 
+function attackableCharacters(state, playerId) {
+  const player = getPlayer(state, playerId);
+  const candidates = [];
+  for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
+    player[lineName].forEach((permanent, index) => {
+      if (!isCharacter(state, permanent) || permanent.rested || hasKeyword(state, permanent, "cantAttack")) return;
+      if (lineName === LINES.ENERGY && !hasKeyword(state, permanent, "canAttackFromEnergyLine")) return;
+      candidates.push({ lineName, index, permanent });
+    });
+  }
+  return candidates;
+}
+
+function mandatoryAttackers(state, playerId) {
+  return attackableCharacters(state, playerId)
+    .filter(({ permanent }) => hasKeyword(state, permanent, "mustAttack"));
+}
+
+function blockerCanBlockAttacker(state, blocker, attacker) {
+  if (!isCharacter(state, blocker) || blocker.rested || hasKeyword(state, blocker, "cantBlock")) return false;
+  if (hasKeyword(state, blocker, "cantBlockBelowBaseBp") && battlePower(state, blocker) < (topDef(state, blocker).bp ?? 0)) return false;
+  const attackerBpBlockMax = keywordValue(state, blocker, "cantBlockAttackerBpMax", 0);
+  if (attackerBpBlockMax !== 0 && battlePower(state, attacker) <= attackerBpBlockMax) return false;
+  if (hasKeyword(state, attacker, "cantBeBlockedByRaided") && blocker.cards.length > 1) return false;
+  const requiredEnergyBlockMin = keywordValue(state, attacker, "cantBeBlockedByRequiredEnergyMin", 0);
+  if (requiredEnergyBlockMin !== 0 && (topDef(state, blocker).requiredEnergy?.amount ?? 0) >= requiredEnergyBlockMin) return false;
+  const bpBlockMin = keywordValue(state, attacker, "cantBeBlockedByBpMin", 0);
+  if (bpBlockMin !== 0 && battlePower(state, blocker) >= bpBlockMin) return false;
+  const bpBlockMax = keywordValue(state, attacker, "cantBeBlockedByBpMax", 0);
+  if (bpBlockMax !== 0 && battlePower(state, blocker) <= bpBlockMax) return false;
+  return true;
+}
+
+function canBeTargetedBySnipe(state, attacker, defender) {
+  if (hasKeyword(state, defender, "snipeProtection")) return false;
+  const forbiddenBpMin = keywordValue(state, attacker, "snipeCannotTargetBpMin", 0);
+  if (forbiddenBpMin !== 0 && battlePower(state, defender) >= forbiddenBpMin) return false;
+  return true;
+}
+
+function blockerMustBlockAttacker(state, blocker, attacker) {
+  if (hasKeyword(state, blocker, "mustBlockAttacks")) return true;
+  return (blocker.keywordModifiers ?? [])
+    .some((modifier) => modifier.keyword === "mustBlockAttacker" && modifier.value === attacker.pid);
+}
+
+function eligibleBlockers(state, defenderPlayerId, attacker) {
+  return getPlayer(state, defenderPlayerId).frontLine
+    .map((permanent, index) => ({ permanent, index }))
+    .filter(({ permanent }) => blockerCanBlockAttacker(state, permanent, attacker));
+}
+
+function attackMustBeBlocked(state, attacker) {
+  return hasKeyword(state, attacker, "mustBlock")
+    || (hasKeyword(state, attacker, "mustBlockFirstAttack") && attacker.attacksThisTurn === 1);
+}
+
 function declareAttack(state, action) {
   const player = getPlayer(state, action.player);
   assertRule(state.activePlayer === action.player && state.phase === PHASES.ATTACK, "PHASE", "Attacks can be declared during your attack phase.");
   assertRule(!state.pendingAttack, "ATTACK_PENDING", "Resolve the current attack before declaring another.");
   const attackerLine = action.attackerLine ?? LINES.FRONT;
-  const attacker = lineOf(player, attackerLine)[action.attackerIndex];
+  let attacker = lineOf(player, attackerLine)[action.attackerIndex];
   assertRule(attacker, "ATTACKER", "Attacker does not exist.");
   assertRule(isCharacter(state, attacker), "ATTACKER", "Only characters can attack.");
   assertRule(!attacker.rested, "ATTACKER_RESTED", "Only active characters can attack.");
   assertRule(!hasKeyword(state, attacker, "cantAttack"), "ATTACKER", "This character cannot attack.");
   assertRule(attackerLine === LINES.FRONT || hasKeyword(state, attacker, "canAttackFromEnergyLine"), "ATTACKER", "Only front-line characters can attack unless an ability allows otherwise.");
+  const requiredAttackers = mandatoryAttackers(state, action.player);
+  assertRule(requiredAttackers.length === 0 || requiredAttackers.some((candidate) => candidate.permanent.pid === attacker.pid), "MUST_ATTACK", "A character that must attack must be used before other attackers.");
 
   attacker.rested = true;
   attacker.attacksThisTurn += 1;
   resolvePermanentAbilities(state, action.player, attacker, TIMINGS.WHEN_ATTACKING, { permanent: attacker, choices: action.choices });
   resolveFieldPermanentAbilities(state, action.player, TIMINGS.WHEN_OWN_CHARACTER_ATTACKS, { attacker, choices: action.choices });
+  if (state.winner) {
+    state.pendingAttack = null;
+    return;
+  }
+  let attackerLocation = findPermanentLocation(player, attacker.pid);
+  if (!attackerLocation) {
+    state.pendingAttack = null;
+    state.log.push(`${action.player}'s attack ended because the attacker left the field.`);
+    return;
+  }
+  attacker = player[attackerLocation.lineName][attackerLocation.index];
+
   if (hasKeyword(state, attacker, "drawOnAttack")) {
     drawCards(state, action.player, keywordValue(state, attacker, "drawOnAttack", 1));
   }
   if (attackerLine === LINES.ENERGY && hasKeyword(state, attacker, "moveToFrontOnEnergyAttack")) {
     attacker.keywordModifiers.push({ keyword: "snipe", value: true, expires: "endOfTurn" });
     const location = findPermanentLocation(player, attacker.pid);
-    if (location?.lineName === LINES.ENERGY && player.frontLine.length < MAX_LINE_SIZE) {
+    if (location?.lineName === LINES.ENERGY && player.frontLine.length < lineCapacity(state, action.player, LINES.FRONT)) {
       const moved = removeFromLine(player, LINES.ENERGY, location.index);
-      insertPermanent(state, action.player, LINES.FRONT, moved);
+      insertPermanent(state, action.player, LINES.FRONT, moved, undefined, {
+        operation: "move",
+        sourcePermanent: moved
+      });
       resolveCharacterMovedOutsideMovementPhase(state, action.player, moved, LINES.ENERGY, LINES.FRONT);
     }
   }
+  attackerLocation = findPermanentLocation(player, attacker.pid);
+  if (!attackerLocation) {
+    state.pendingAttack = null;
+    state.log.push(`${action.player}'s attack ended because the attacker left the field.`);
+    return;
+  }
+  attacker = player[attackerLocation.lineName][attackerLocation.index];
 
   if (hasKeyword(state, attacker, "doubleAttack") && attacker.attacksThisTurn === 1) {
     readyPermanent(attacker);
@@ -4607,9 +6563,12 @@ function declareAttack(state, action) {
     assertRule(hasKeyword(state, attacker, "snipe"), "SNIPE", "Only characters with Snipe can target opposing characters.");
     const defender = getOpponent(state, action.player).frontLine[action.target.index];
     assertRule(defender, "ATTACK_TARGET", "Snipe target does not exist.");
+    assertRule(canBeTargetedBySnipe(state, attacker, defender), "SNIPE_TARGET", "That character cannot be targeted by this Snipe attack.");
     resolveBattle(state, action.player, attacker.pid, defender.pid, {
       lifeIndices: action.lifeIndices,
-      triggerChoices: action.triggerChoices
+      triggerChoices: action.triggerChoices,
+      energyLineReplaceIndex: action.energyLineReplaceIndex,
+      choices: action.choices
     });
     return;
   }
@@ -4628,37 +6587,60 @@ function declareBlock(state, action) {
   const defender = getPlayer(state, action.player);
   const blocker = defender.frontLine[action.blockerIndex];
   assertRule(blocker, "BLOCKER", "Blocker does not exist.");
-  assertRule(isCharacter(state, blocker), "BLOCKER", "Only characters can block.");
-  assertRule(!blocker.rested, "BLOCKER_RESTED", "Only active characters can block.");
-  assertRule(!hasKeyword(state, blocker, "cantBlock"), "BLOCKER", "This character cannot block.");
   const attackerPlayer = getPlayer(state, state.pendingAttack.attackerPlayer);
   const attackerLocation = findPermanentLocation(attackerPlayer, state.pendingAttack.attackerPermanentId);
-  assertRule(attackerLocation, "ATTACKER", "Attacker is no longer on the field.");
+  if (!attackerLocation) {
+    state.pendingAttack = null;
+    state.log.push("The attack ended because the attacker left the field.");
+    return;
+  }
   const attacker = attackerPlayer[attackerLocation.lineName][attackerLocation.index];
-  const requiredEnergyBlockMin = keywordValue(state, attacker, "cantBeBlockedByRequiredEnergyMin", 0);
-  assertRule(requiredEnergyBlockMin === 0 || (topDef(state, blocker).requiredEnergy?.amount ?? 0) < requiredEnergyBlockMin, "BLOCK_RESTRICTION", "This blocker is not allowed to block this attacker.");
-  const bpBlockMin = keywordValue(state, attacker, "cantBeBlockedByBpMin", 0);
-  assertRule(bpBlockMin === 0 || battlePower(state, blocker) < bpBlockMin, "BLOCK_RESTRICTION", "This blocker is not allowed to block this attacker.");
-  const bpBlockMax = keywordValue(state, attacker, "cantBeBlockedByBpMax", 0);
-  assertRule(bpBlockMax === 0 || battlePower(state, blocker) > bpBlockMax, "BLOCK_RESTRICTION", "This blocker is not allowed to block this attacker.");
+  assertRule(blockerCanBlockAttacker(state, blocker, attacker), "BLOCK_RESTRICTION", "This blocker is not allowed to block this attacker.");
+  const mandatory = eligibleBlockers(state, action.player, attacker)
+    .filter(({ permanent }) => blockerMustBlockAttacker(state, permanent, attacker));
+  assertRule(mandatory.length === 0 || mandatory.some((candidate) => candidate.permanent.pid === blocker.pid), "MUST_BLOCK", "A character required to block this attack must be chosen if able.");
 
   blocker.rested = true;
   blocker.blocksThisTurn += 1;
-  resolvePermanentAbilities(state, action.player, blocker, TIMINGS.WHEN_BLOCKING, { permanent: blocker, attacker });
+  resolvePermanentAbilities(state, action.player, blocker, TIMINGS.WHEN_BLOCKING, { permanent: blocker, attacker, choices: action.choices });
+  if (state.winner) {
+    state.pendingAttack = null;
+    return;
+  }
 
   if (hasKeyword(state, blocker, "doubleBlock") && blocker.blocksThisTurn === 1) {
     readyPermanent(blocker);
   }
 
-  const currentAttackerLocation = findPermanentLocation(attackerPlayer, state.pendingAttack.attackerPermanentId);
+  let currentAttackerLocation = findPermanentLocation(attackerPlayer, state.pendingAttack.attackerPermanentId);
+  let currentBlockerLocation = findPermanentLocation(defender, blocker.pid);
+  if (!currentAttackerLocation || !currentBlockerLocation) {
+    finishAttack(state, state.pendingAttack.attackerPlayer, attacker);
+    state.log.push("The attack ended before battle because a battling character left the field.");
+    return;
+  }
+
   if (currentAttackerLocation) {
     const currentAttacker = attackerPlayer[currentAttackerLocation.lineName][currentAttackerLocation.index];
     resolvePermanentAbilities(state, state.pendingAttack.attackerPlayer, currentAttacker, TIMINGS.WHEN_ATTACK_BLOCKED, { permanent: currentAttacker, blocker });
   }
+  if (state.winner) {
+    state.pendingAttack = null;
+    return;
+  }
+  currentAttackerLocation = findPermanentLocation(attackerPlayer, state.pendingAttack.attackerPermanentId);
+  currentBlockerLocation = findPermanentLocation(defender, blocker.pid);
+  if (!currentAttackerLocation || !currentBlockerLocation) {
+    finishAttack(state, state.pendingAttack.attackerPlayer, attacker);
+    state.log.push("The attack ended before battle because a battling character left the field.");
+    return;
+  }
 
   resolveBattle(state, state.pendingAttack.attackerPlayer, state.pendingAttack.attackerPermanentId, blocker.pid, {
     lifeIndices: action.lifeIndices,
-    triggerChoices: action.triggerChoices
+    triggerChoices: action.triggerChoices,
+    energyLineReplaceIndex: action.energyLineReplaceIndex,
+    choices: action.choices
   });
 }
 
@@ -4668,15 +6650,19 @@ function declineBlock(state, action) {
   const attackerPlayerId = state.pendingAttack.attackerPlayer;
   const attackerPlayer = getPlayer(state, attackerPlayerId);
   const location = findPermanentLocation(attackerPlayer, state.pendingAttack.attackerPermanentId);
-  assertRule(location, "ATTACKER", "Attacker is no longer on the field.");
-  const attacker = attackerPlayer[location.lineName][location.index];
-  if (hasKeyword(state, attacker, "mustBlock")) {
-    const defender = getPlayer(state, action.player);
-    const hasAvailableBlocker = defender.frontLine.some((permanent) => isCharacter(state, permanent) && !permanent.rested);
-    assertRule(!hasAvailableBlocker, "MUST_BLOCK", "This attack must be blocked if able.");
+  if (!location) {
+    state.pendingAttack = null;
+    state.log.push("The attack ended because the attacker left the field.");
+    return;
   }
+  const attacker = attackerPlayer[location.lineName][location.index];
+  const availableBlockers = eligibleBlockers(state, action.player, attacker);
+  const mandatory = availableBlockers.filter(({ permanent }) => blockerMustBlockAttacker(state, permanent, attacker));
+  assertRule(mandatory.length === 0, "MUST_BLOCK", "A character must block this attack if able.");
+  assertRule(!attackMustBeBlocked(state, attacker) || availableBlockers.length === 0, "MUST_BLOCK", "This attack must be blocked if able.");
   dealDamage(state, action.player, directDamageAmount(state, attacker), {
     sourcePlayer: attackerPlayerId,
+    sourcePermanent: attacker,
     lifeIndices: action.lifeIndices,
     triggerChoices: action.triggerChoices
   });
@@ -4702,15 +6688,35 @@ function resolveBattle(state, attackerPlayerId, attackerPermanentId, defenderPer
   const defender = defenderPlayer[defenderLocation.lineName][defenderLocation.index];
 
   if (battlePower(state, attacker) >= battlePower(state, defender)) {
-    const defeatedZone = topDef(state, attacker).battleLosersToRemovalInstead ? "removal" : "sideline";
-    removePermanentToZone(state, defenderPlayerId, defenderLocation.lineName, defenderLocation.index, defeatedZone, {
-      sidelined: defeatedZone === "sideline",
-      sourcePlayer: attackerPlayerId
-    });
+    const attackerDef = topDef(state, attacker);
+    if (attackerDef.battleLosersToEnergyInstead) {
+      const moved = removeFromLine(defenderPlayer, defenderLocation.lineName, defenderLocation.index);
+      const replaceIndex = defenderPlayer.energyLine.length >= lineCapacity(state, defenderPlayerId, LINES.ENERGY)
+        ? options.energyLineReplaceIndex ?? 0
+        : undefined;
+      insertPermanent(state, defenderPlayerId, LINES.ENERGY, moved, replaceIndex, {
+        operation: "move",
+        sourcePermanent: attacker,
+        choices: options.choices
+      });
+      resolveCharacterMovedOutsideMovementPhase(state, defenderPlayerId, moved, defenderLocation.lineName, LINES.ENERGY, {
+        sourceDef: attackerDef,
+        sourceKind: "character",
+        permanent: attacker,
+        choices: options.choices
+      });
+    } else {
+      const defeatedZone = attackerDef.battleLosersToRemovalInstead ? "removal" : "sideline";
+      removePermanentToZone(state, defenderPlayerId, defenderLocation.lineName, defenderLocation.index, defeatedZone, {
+        sidelined: defeatedZone === "sideline",
+        sourcePlayer: attackerPlayerId
+      });
+    }
     const impactDamage = impactDamageAmount(state, attacker, defender);
     if (impactDamage > 0) {
       dealDamage(state, defenderPlayerId, impactDamage, {
         sourcePlayer: attackerPlayerId,
+        sourcePermanent: attacker,
         lifeIndices: options.lifeIndices,
         triggerChoices: options.triggerChoices
       });
@@ -4735,10 +6741,12 @@ function discardForHandLimit(state, action) {
   const player = getPlayer(state, action.player);
   assertRule(state.activePlayer === action.player && state.phase === PHASES.END, "PHASE", "Hand limit cleanup happens during your end phase.");
   assertRule(Array.isArray(action.handIndices), "HAND_LIMIT", "Provide hand indices to remove.");
-  const excess = Math.max(0, player.hand.length - MAX_HAND_AT_END);
-  assertRule(action.handIndices.length === excess, "HAND_LIMIT", "Discard exactly enough cards to keep eight.", {
+  const maximum = maximumHandSize(state, action.player);
+  const excess = Math.max(0, player.hand.length - maximum);
+  assertRule(action.handIndices.length === excess, "HAND_LIMIT", `Discard exactly enough cards to keep ${maximum}.`, {
     hand: player.hand.length,
-    excess
+    excess,
+    maximum
   });
 
   const sorted = [...action.handIndices].sort((a, b) => b - a);
@@ -4762,7 +6770,8 @@ function runZoneMoveDelayedEffects(state, timing, playerId) {
         if (location) {
           removePermanentToZone(state, location.playerId, location.lineName, location.index, effect.zone ?? "sideline", {
             sidelined: effect.sidelined ?? (effect.zone ?? "sideline") === "sideline",
-            sourcePlayer: effect.controller
+            sourcePlayer: effect.controller,
+            byAbility: true
           });
         }
       }
@@ -4785,7 +6794,7 @@ function runStartOfEndPhaseSteps(state) {
 function runEndPhaseSteps(state) {
   const player = getPlayer(state, state.activePlayer);
   readyField(player, { includeAp: false });
-  assertRule(player.hand.length <= MAX_HAND_AT_END, "HAND_LIMIT", "Choose cards to keep before ending the turn.");
+  assertRule(player.hand.length <= maximumHandSize(state, state.activePlayer), "HAND_LIMIT", "Choose cards to keep before ending the turn.");
   state.continuousEffects = state.continuousEffects.filter((effect) => {
     if (effect.expires === "endOfTurn" && effect.controller === state.activePlayer) return false;
     if (effect.expires === "endOfOpponentTurn" && opponentOf(effect.controller) === state.activePlayer) return false;
@@ -4813,7 +6822,7 @@ function runEndOfMainPhaseSteps(state) {
     if (effect.kind === "sidelinePermanent") {
       const location = findPermanentById(state, effect.controller, effect.permanentId);
       if (location) {
-        removePermanentToZone(state, effect.controller, location.lineName, location.index, "sideline", { sidelined: true, sourcePlayer: effect.controller });
+        removePermanentToZone(state, effect.controller, location.lineName, location.index, "sideline", { sidelined: true, sourcePlayer: effect.controller, byAbility: true });
       }
     }
   }
@@ -4832,7 +6841,7 @@ function runStartOfTurnDelayedEffects(state, playerId) {
       for (const permanentId of effect.permanentIds ?? []) {
         const location = findPermanentByIdAnyPlayer(state, permanentId);
         if (location) {
-          removePermanentToZone(state, location.playerId, location.lineName, location.index, "sideline", { sidelined: true, sourcePlayer: effect.controller });
+          removePermanentToZone(state, location.playerId, location.lineName, location.index, "sideline", { sidelined: true, sourcePlayer: effect.controller, byAbility: true });
         }
       }
 
@@ -4841,7 +6850,10 @@ function runStartOfTurnDelayedEffects(state, playerId) {
         source.permanent.rested = true;
         if (source.lineName !== LINES.ENERGY) {
           const permanent = removeFromLine(getPlayer(state, source.playerId), source.lineName, source.index);
-          insertPermanent(state, source.playerId, LINES.ENERGY, permanent);
+          insertPermanent(state, source.playerId, LINES.ENERGY, permanent, undefined, {
+            operation: "move",
+            sourcePermanent: permanent
+          });
           resolveCharacterMovedOutsideMovementPhase(state, source.playerId, permanent, source.lineName, LINES.ENERGY);
         }
       }
@@ -4851,7 +6863,7 @@ function runStartOfTurnDelayedEffects(state, playerId) {
       for (const permanentId of effect.permanentIds ?? []) {
         const location = findPermanentByIdAnyPlayer(state, permanentId);
         if (location) {
-          removePermanentToZone(state, location.playerId, location.lineName, location.index, "hand", { sidelined: false, sourcePlayer: effect.controller });
+          removePermanentToZone(state, location.playerId, location.lineName, location.index, "hand", { sidelined: false, sourcePlayer: effect.controller, byAbility: true });
         }
       }
     }
@@ -4871,7 +6883,7 @@ function runEndOfAttackDelayedEffects(state, playerId) {
       for (const permanentId of effect.permanentIds ?? []) {
         const location = findPermanentByIdAnyPlayer(state, permanentId);
         if (location) {
-          removePermanentToZone(state, location.playerId, location.lineName, location.index, "hand", { sidelined: false, sourcePlayer: effect.controller });
+          removePermanentToZone(state, location.playerId, location.lineName, location.index, "hand", { sidelined: false, sourcePlayer: effect.controller, byAbility: true });
         }
       }
     }
@@ -4893,10 +6905,11 @@ function advancePhase(state, action) {
     case PHASES.MAIN:
       runEndOfMainPhaseSteps(state);
       state.phase = PHASES.ATTACK;
-      resolveAttackPhaseTiming(state, TIMINGS.START_OF_ATTACK_PHASE);
+      resolveAttackPhaseTiming(state, TIMINGS.START_OF_ATTACK_PHASE, action.choices);
       break;
     case PHASES.ATTACK:
-      resolveAttackPhaseTiming(state, TIMINGS.END_OF_ATTACK_PHASE);
+      assertRule(mandatoryAttackers(state, state.activePlayer).length === 0, "MUST_ATTACK", "A character that must attack is still able to attack.");
+      resolveAttackPhaseTiming(state, TIMINGS.END_OF_ATTACK_PHASE, action.choices);
       runZoneMoveDelayedEffects(state, TIMINGS.END_OF_ATTACK_PHASE, state.activePlayer);
       runEndOfAttackDelayedEffects(state, state.activePlayer);
       state.phase = PHASES.END;
@@ -4915,7 +6928,7 @@ function extraDraw(state, action) {
   const player = getPlayer(state, action.player);
   assertRule(action.player === state.activePlayer && state.phase === PHASES.START, "PHASE", "Extra draw can only be taken during your start phase.");
   assertRule(!player.extraDrawUsed, "EXTRA_DRAW", "Extra draw is once per turn.");
-  payAp(player, 1);
+  if (!hasFreeExtraDraw(state, action.player)) payAp(state, action.player, 1);
   player.extraDrawUsed = true;
   flagExtraDrawUsed(state, action.player);
   drawCards(state, action.player, 1);
@@ -4945,6 +6958,7 @@ export function createGame(options) {
 
   const state = {
     version: 1,
+    seed,
     catalog,
     firstPlayer,
     activePlayer: firstPlayer,
@@ -4957,6 +6971,8 @@ export function createGame(options) {
     settings: { autoActivateTriggers },
     continuousEffects: [],
     delayedEffects: [],
+    publicKnowledge: freshPublicKnowledge(),
+    shuffleCounter: 0,
     turnFlags: freshTurnFlags(),
     players: {},
     log: []
@@ -4969,7 +6985,7 @@ export function createGame(options) {
       state.nextCardId += 1;
       return ref;
     });
-    const deck = skipShuffle ? refs : shuffled(refs, seed + (playerId === "P1" ? 11 : 29));
+    const deck = skipShuffle ? refs : shuffled(refs, deriveSeed(seed, playerId, "initial-deck"));
     state.players[playerId] = {
       id: playerId,
       deck,
@@ -4982,6 +6998,7 @@ export function createGame(options) {
       removal: [],
       turnsTaken: 0,
       mulliganUsed: false,
+      shuffleCounter: 0,
       setupKept: false,
       extraDrawUsed: false,
       usedTurnAbilityKeys: []
@@ -5002,6 +7019,9 @@ export function createGame(options) {
 
 export function applyAction(inputState, action) {
   const state = cloneState(inputState);
+  if (typeof action.resolutionChoiceResolver === "function") {
+    resolutionChoiceResolvers.set(state, action.resolutionChoiceResolver);
+  }
   if (state.winner) return state;
 
   switch (action.type) {
@@ -5010,7 +7030,9 @@ export function applyAction(inputState, action) {
       const player = getPlayer(state, action.player);
       assertRule(!player.mulliganUsed && !player.setupKept, "MULLIGAN", "This player cannot mulligan again.");
       player.deck.push(...player.hand.splice(0));
-      player.deck = shuffled(player.deck, state.nextCardId + player.deck.length);
+      state.shuffleCounter += 1;
+      player.shuffleCounter = Number(player.shuffleCounter ?? 0) + 1;
+      player.deck = shuffled(player.deck, deriveSeed(state.seed, action.player, "mulligan", player.shuffleCounter));
       drawCards(state, action.player, STARTING_HAND_SIZE);
       player.mulliganHandDefIds = cardDefIds(player.hand);
       player.keptHandDefIds = cardDefIds(player.hand);
@@ -5061,35 +7083,86 @@ export function applyAction(inputState, action) {
       throw new Error(`Unknown action type: ${action.type}`);
   }
 
+  if (state.setupComplete) resolveStateBasedActions(state);
   return state;
 }
 
 function addLegalMovementActions(state, playerId, player, actions) {
-  if (player.frontLine.length < MAX_LINE_SIZE) {
-    player.energyLine.forEach((permanent, index) => {
-      const move = { from: LINES.ENERGY, index, to: LINES.FRONT };
-      if (isCharacter(state, permanent) && !topDef(state, permanent).cannotEnterFrontLine && !hasKeyword(state, permanent, "cannotMove") && !movementRestricted(state, playerId, move)) {
-        actions.push({
-          type: "moveCharacters",
-          player: playerId,
-          moves: [move]
-        });
-      }
-    });
+  if (state.turnFlags?.[playerId]?.movementActionUsed) return;
+  const eligible = [];
+  player.energyLine.forEach((permanent, index) => {
+    const move = { from: LINES.ENERGY, index, to: LINES.FRONT, permanentId: permanent.pid };
+    if (isCharacter(state, permanent)
+      && permanentCanEnterLine(state, playerId, permanent, LINES.FRONT, { operation: "movementPhase" })
+      && !hasKeyword(state, permanent, "cannotMove")
+      && !movementRestricted(state, playerId, move)) {
+      eligible.push(move);
+    }
+  });
+  player.frontLine.forEach((permanent, index) => {
+    const move = { from: LINES.FRONT, index, to: LINES.ENERGY, permanentId: permanent.pid };
+    if (isCharacter(state, permanent)
+      && hasKeyword(state, permanent, "step")
+      && permanentCanEnterLine(state, playerId, permanent, LINES.ENERGY, { operation: "movementPhase" })
+      && !hasKeyword(state, permanent, "cannotMove")
+      && !movementRestricted(state, playerId, move)) {
+      eligible.push(move);
+    }
+  });
+
+  for (let mask = 1; mask < 2 ** eligible.length; mask += 1) {
+    const moves = eligible.filter((_, index) => (mask & (2 ** index)) !== 0);
+    for (const movementReplacements of movementReplacementPlans(state, playerId, moves)) {
+      actions.push({
+        type: "moveCharacters",
+        player: playerId,
+        moves: moves.map(({ permanentId, ...move }) => move),
+        ...(movementReplacements.length > 0 ? { movementReplacements } : {})
+      });
+    }
+  }
+}
+
+function movementReplacementPlans(state, playerId, moves) {
+  const player = getPlayer(state, playerId);
+  const movingIds = new Set(moves.map((move) => move.permanentId));
+  const choicesByLine = [];
+  for (const lineName of [LINES.FRONT, LINES.ENERGY]) {
+    const outgoing = moves.filter((move) => move.from === lineName).length;
+    const incoming = moves.filter((move) => move.to === lineName).length;
+    const overflow = Math.max(0, player[lineName].length - outgoing + incoming - lineCapacity(state, playerId, lineName));
+    const eligible = player[lineName]
+      .map((permanent, index) => ({ line: lineName, index, permanentId: permanent.pid }))
+      .filter((replacement) => !movingIds.has(replacement.permanentId));
+    if (overflow > eligible.length) return [];
+    choicesByLine.push(movementReplacementCombinations(eligible, overflow));
   }
 
-  if (player.energyLine.length < MAX_LINE_SIZE) {
-    player.frontLine.forEach((permanent, index) => {
-      const move = { from: LINES.FRONT, index, to: LINES.ENERGY };
-      if (isCharacter(state, permanent) && hasKeyword(state, permanent, "step") && !hasKeyword(state, permanent, "cannotMove") && !movementRestricted(state, playerId, move)) {
-        actions.push({
-          type: "moveCharacters",
-          player: playerId,
-          moves: [move]
-        });
-      }
-    });
+  const plans = [];
+  for (const frontChoices of choicesByLine[0]) {
+    for (const energyChoices of choicesByLine[1]) {
+      plans.push([...frontChoices, ...energyChoices]);
+    }
   }
+  return plans;
+}
+
+function movementReplacementCombinations(entries, count) {
+  if (count === 0) return [[]];
+  const combinations = [];
+  const visit = (start, selected) => {
+    if (selected.length === count) {
+      combinations.push([...selected]);
+      return;
+    }
+    for (let index = start; index <= entries.length - (count - selected.length); index += 1) {
+      selected.push(entries[index]);
+      visit(index + 1, selected);
+      selected.pop();
+    }
+  };
+  visit(0, []);
+  return combinations;
 }
 
 function addLegalRaidActions(state, playerId, player, handIndex, cardDef, actions) {
@@ -5101,7 +7174,7 @@ function addLegalRaidActions(state, playerId, player, handIndex, cardDef, action
     lineOf(player, targetLine).forEach((permanent, targetIndex) => {
       if (!isCharacter(state, permanent)) return;
       if (topDef(state, permanent).raid) return;
-      if (!matchesRaidRequirement(state, cardDef.raid, permanent)) return;
+      if (!matchesRaidRequirement(state, cardDef.raid, permanent, { raidCardDef: cardDef, sourceKind: "cardUse" })) return;
 
       actions.push({
         type: "performRaid",
@@ -5111,15 +7184,16 @@ function addLegalRaidActions(state, playerId, player, handIndex, cardDef, action
         targetIndex
       });
 
-      if (targetLine === LINES.ENERGY && player.frontLine.length < MAX_LINE_SIZE && !cardDef.cannotEnterFrontLine) {
-        actions.push({
+      if (targetLine === LINES.ENERGY
+        && cardCanEnterLine(state, playerId, cardDef, LINES.FRONT, { operation: "move", permanent })) {
+        addLegalLinePlacementActions(state, playerId, LINES.FRONT, {
           type: "performRaid",
           player: playerId,
           handIndex,
           targetLine,
           targetIndex,
           moveToFront: true
-        });
+        }, actions);
       }
     });
   }
@@ -5167,19 +7241,41 @@ export function legalActions(state, playerId) {
   }
 
   if (state.pendingAttack?.defenderPlayer === playerId) {
-    actions.push({ type: "declineBlock", player: playerId });
-    player.frontLine.forEach((permanent, index) => {
-      if (isCharacter(state, permanent) && !permanent.rested && !hasKeyword(state, permanent, "cantBlock")) {
-        actions.push({ type: "declareBlock", player: playerId, blockerIndex: index });
+    const attackerPlayer = getPlayer(state, state.pendingAttack.attackerPlayer);
+    const attackerLocation = findPermanentLocation(attackerPlayer, state.pendingAttack.attackerPermanentId);
+    if (!attackerLocation) return [{ type: "declineBlock", player: playerId }];
+    const attacker = attackerPlayer[attackerLocation.lineName][attackerLocation.index];
+    const eligible = eligibleBlockers(state, playerId, attacker);
+    const mandatory = eligible.filter(({ permanent }) => blockerMustBlockAttacker(state, permanent, attacker));
+    const blockers = mandatory.length > 0 ? mandatory : eligible;
+    if (mandatory.length === 0 && (!attackMustBeBlocked(state, attacker) || eligible.length === 0)) {
+      actions.push({ type: "declineBlock", player: playerId });
+    }
+    for (const blocker of blockers) {
+      const attackerMovesBattleLosersToEnergy = Boolean(topDef(state, attacker).battleLosersToEnergyInstead);
+      const fullEnergyLine = player.energyLine.length >= lineCapacity(state, playerId, LINES.ENERGY);
+      if (attackerMovesBattleLosersToEnergy && fullEnergyLine && player.energyLine.length > 0) {
+        player.energyLine.forEach((_, energyLineReplaceIndex) => {
+          actions.push({
+            type: "declareBlock",
+            player: playerId,
+            blockerIndex: blocker.index,
+            energyLineReplaceIndex
+          });
+        });
+      } else {
+        actions.push({ type: "declareBlock", player: playerId, blockerIndex: blocker.index });
       }
-    });
+    }
     return actions;
   }
 
   if (state.activePlayer !== playerId) return actions;
 
   if (state.phase === PHASES.START) {
-    if (!player.extraDrawUsed && activeAp(player) >= 1) actions.push({ type: "extraDraw", player: playerId });
+    if (!player.extraDrawUsed && (activeAp(player) >= 1 || hasFreeExtraDraw(state, playerId))) {
+      actions.push({ type: "extraDraw", player: playerId });
+    }
     actions.push({ type: "advancePhase", player: playerId });
   } else if (state.phase === PHASES.MOVEMENT) {
     addLegalMovementActions(state, playerId, player, actions);
@@ -5192,43 +7288,59 @@ export function legalActions(state, playerId) {
       const normalUseOptions = { sourceZone: "hand" };
       if (canUseCard(state, playerId, def, normalUseOptions)) {
         if (def.type === CARD_TYPES.EVENT) actions.push({ type: "playCard", player: playerId, handIndex });
-        if (def.type === CARD_TYPES.SITE) actions.push({ type: "playCard", player: playerId, handIndex, destination: LINES.ENERGY });
+        if (def.type === CARD_TYPES.SITE && cardCanEnterLine(state, playerId, def, LINES.ENERGY, { operation: "play" })) {
+          addLegalLinePlacementActions(state, playerId, LINES.ENERGY, {
+            type: "playCard",
+            player: playerId,
+            handIndex,
+            destination: LINES.ENERGY
+          }, actions);
+        }
         if (def.type === CARD_TYPES.CHARACTER) {
-          if (!def.cannotEnterFrontLine) actions.push({ type: "playCard", player: playerId, handIndex, destination: LINES.FRONT });
-          actions.push({ type: "playCard", player: playerId, handIndex, destination: LINES.ENERGY });
+          if (cardCanEnterLine(state, playerId, def, LINES.FRONT, { operation: "play" })) {
+            addLegalLinePlacementActions(state, playerId, LINES.FRONT, {
+              type: "playCard",
+              player: playerId,
+              handIndex,
+              destination: LINES.FRONT
+            }, actions);
+          }
+          if (cardCanEnterLine(state, playerId, def, LINES.ENERGY, { operation: "play" })) {
+            addLegalLinePlacementActions(state, playerId, LINES.ENERGY, {
+              type: "playCard",
+              player: playerId,
+              handIndex,
+              destination: LINES.ENERGY
+            }, actions);
+          }
         }
       }
       if (def.type === CARD_TYPES.CHARACTER) addLegalRaidActions(state, playerId, player, handIndex, def, actions);
     });
   } else if (state.phase === PHASES.ATTACK) {
-    actions.push({ type: "advancePhase", player: playerId });
     const opponent = getOpponent(state, playerId);
-    player.frontLine.forEach((permanent, attackerIndex) => {
-      if (isCharacter(state, permanent) && !permanent.rested && !hasKeyword(state, permanent, "cantAttack")) {
-        actions.push({ type: "declareAttack", player: playerId, attackerIndex, target: { type: "player" } });
-        if (hasKeyword(state, permanent, "snipe")) {
-          opponent.frontLine.forEach((target, targetIndex) => {
-            if (isCharacter(state, target)) {
-              actions.push({ type: "declareAttack", player: playerId, attackerIndex, target: { type: "character", index: targetIndex } });
-            }
-          });
-        }
+    const available = attackableCharacters(state, playerId);
+    const mandatory = available.filter(({ permanent }) => hasKeyword(state, permanent, "mustAttack"));
+    const attackers = mandatory.length > 0 ? mandatory : available;
+    if (mandatory.length === 0) actions.push({ type: "advancePhase", player: playerId });
+    for (const { lineName, index: attackerIndex, permanent } of attackers) {
+      const baseAction = {
+        type: "declareAttack",
+        player: playerId,
+        ...(lineName === LINES.ENERGY ? { attackerLine: LINES.ENERGY } : {}),
+        attackerIndex
+      };
+      actions.push({ ...baseAction, target: { type: "player" } });
+      if (hasKeyword(state, permanent, "snipe")) {
+        opponent.frontLine.forEach((target, targetIndex) => {
+          if (isCharacter(state, target) && canBeTargetedBySnipe(state, permanent, target)) {
+            actions.push({ ...baseAction, target: { type: "character", index: targetIndex } });
+          }
+        });
       }
-    });
-    player.energyLine.forEach((permanent, attackerIndex) => {
-      if (isCharacter(state, permanent) && !permanent.rested && !hasKeyword(state, permanent, "cantAttack") && hasKeyword(state, permanent, "canAttackFromEnergyLine")) {
-        actions.push({ type: "declareAttack", player: playerId, attackerLine: LINES.ENERGY, attackerIndex, target: { type: "player" } });
-        if (hasKeyword(state, permanent, "snipe")) {
-          opponent.frontLine.forEach((target, targetIndex) => {
-            if (isCharacter(state, target)) {
-              actions.push({ type: "declareAttack", player: playerId, attackerLine: LINES.ENERGY, attackerIndex, target: { type: "character", index: targetIndex } });
-            }
-          });
-        }
-      }
-    });
+    }
   } else if (state.phase === PHASES.END) {
-    if (player.hand.length > MAX_HAND_AT_END) {
+    if (player.hand.length > maximumHandSize(state, playerId)) {
       actions.push({ type: "discardForHandLimit", player: playerId });
     } else {
       actions.push({ type: "advancePhase", player: playerId });
@@ -5242,6 +7354,8 @@ export const internals = {
   activeAp,
   apCostForCardUse,
   battlePower,
+  cardDefMatchesFilter,
+  cardCanEnterLine,
   dealDamage,
   energyAvailable,
   directDamageAmount,
@@ -5249,5 +7363,9 @@ export const internals = {
   hasKeyword,
   impactDamageAmount,
   keywordValue,
-  requiredEnergyForCardUse
+  lineCapacity,
+  permanentCanEnterLine,
+  raidTargetsForCard,
+  requiredEnergyForCardUse,
+  targetingTaxPaymentsForTarget
 };

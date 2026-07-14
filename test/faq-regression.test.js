@@ -3,11 +3,13 @@ import assert from "node:assert/strict";
 import {
   CARD_TYPES,
   LINES,
+  PHASES,
   TIMINGS,
   applyAction,
   createGame,
   encodeEgmanCardText,
-  internals
+  internals,
+  legalActions
 } from "../src/index.js";
 import { sampleCatalog, sampleDeckList } from "../data/sample-cards.js";
 
@@ -20,6 +22,26 @@ function mainPhaseGame(catalog = sampleCatalog) {
   });
   game = applyAction(game, { type: "advancePhase", player: "P1" });
   return applyAction(game, { type: "advancePhase", player: "P1" });
+}
+
+function faqPermanent(pid, owner, defId, rested = false) {
+  return {
+    pid,
+    owner,
+    controller: owner,
+    cards: [{ uid: `${pid}-card`, owner, defId, faceUp: true }],
+    rested,
+    bpDelta: 0,
+    bpModifiers: [],
+    keywordModifiers: [],
+    energyModifiers: [],
+    gainedAbilities: [],
+    readyLocks: 0,
+    playedThisTurn: false,
+    attacksThisTurn: 0,
+    blocksThisTurn: 0,
+    usedOncePerTurn: []
+  };
 }
 
 test("FAQ regression: choose-two effects require distinct choices and resolve in printed order", () => {
@@ -75,6 +97,7 @@ test("FAQ regression: choose-two effects require distinct choices and resolve in
     handIndex: 0,
     choices: { effectChoices: [0, 0] }
   }), /same effect branch cannot be chosen/i);
+
 });
 
 test("FAQ regression: removing a top Raid card leaves the base on field without firing played or sidelined abilities", () => {
@@ -264,8 +287,8 @@ test("FAQ regression: repeated independent target instructions may choose same o
       bpLossTarget2: [{ player: "P2", lineName: LINES.FRONT, index: 1 }]
     }
   });
-  assert.equal(internals.battlePower(game, game.players.P2.frontLine[0]), 0);
-  assert.equal(internals.battlePower(game, game.players.P2.frontLine[1]), 1500);
+  assert.equal(game.players.P2.sideline.some((item) => item.uid === "target-a-card"), true);
+  assert.equal(internals.battlePower(game, game.players.P2.frontLine[0]), 1500);
 
   game = mainPhaseGame(catalog);
   game.players.P2.frontLine.push({
@@ -294,7 +317,700 @@ test("FAQ regression: repeated independent target instructions may choose same o
       bpLossTarget2: [{ player: "P2", lineName: LINES.FRONT, index: 0 }]
     }
   });
-  assert.equal(internals.battlePower(game, game.players.P2.frontLine[0]), -1000);
+  assert.equal(game.players.P2.frontLine.length, 0);
+  assert.equal(game.players.P2.sideline.some((item) => item.uid === "target-c-card"), true);
+});
+
+test("FAQ regression: BP state checks wait for a complete ability and then sideline zero-BP characters", () => {
+  const catalog = {
+    ...sampleCatalog,
+    state_check_target: {
+      ...sampleCatalog.demo_rookie,
+      id: "state_check_target",
+      number: "FAQ-1-060",
+      name: "State Check Target",
+      bp: 1000
+    },
+    state_check_event: {
+      id: "state_check_event",
+      number: "FAQ-1-061",
+      sourceCode: "FAQ",
+      name: "State Check Event",
+      type: CARD_TYPES.EVENT,
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      affinities: [],
+      eventEffect: {
+        kind: "sequence",
+        effects: [
+          {
+            kind: "modifyBp",
+            amount: -1000,
+            duration: "turn",
+            target: { controller: "opponent", line: LINES.FRONT, max: 1, choiceKey: "stateTarget" }
+          },
+          {
+            kind: "modifyBp",
+            amount: 500,
+            duration: "turn",
+            target: { controller: "opponent", line: LINES.FRONT, max: 1, choiceKey: "stateTarget" }
+          }
+        ]
+      }
+    }
+  };
+
+  let game = mainPhaseGame(catalog);
+  game.players.P2.frontLine = [{
+    pid: "state-target",
+    owner: "P2",
+    controller: "P2",
+    cards: [{ uid: "state-target-card", owner: "P2", defId: "state_check_target", faceUp: true }],
+    rested: false,
+    bpDelta: 0,
+    bpModifiers: [],
+    keywordModifiers: [],
+    energyModifiers: [],
+    gainedAbilities: [],
+    readyLocks: 0,
+    attacksThisTurn: 0,
+    blocksThisTurn: 0,
+    usedOncePerTurn: []
+  }];
+  game.players.P1.hand.unshift({ uid: "state-event-card", owner: "P1", defId: "state_check_event", faceUp: true });
+
+  game = applyAction(game, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    choices: { stateTarget: [{ player: "P2", lineName: LINES.FRONT, index: 0 }] }
+  });
+
+  assert.equal(game.players.P2.frontLine.length, 1);
+  assert.equal(internals.battlePower(game, game.players.P2.frontLine[0]), 500);
+
+  game.players.P1.hand.unshift({ uid: "state-event-card-2", owner: "P1", defId: "state_check_event", faceUp: true });
+  game.catalog.state_check_event.eventEffect.effects.pop();
+  game = applyAction(game, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    choices: { stateTarget: [{ player: "P2", lineName: LINES.FRONT, index: 0 }] }
+  });
+  assert.equal(game.players.P2.frontLine.length, 0);
+  assert.equal(game.players.P2.sideline.some((item) => item.uid === "state-target-card"), true);
+});
+
+test("FAQ regression: an ability that leaves a player with no life ends the game after resolving", () => {
+  const catalog = {
+    ...sampleCatalog,
+    life_loss_event: {
+      id: "life_loss_event",
+      number: "FAQ-1-062",
+      sourceCode: "FAQ",
+      name: "Life Loss Event",
+      type: CARD_TYPES.EVENT,
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      affinities: [],
+      eventEffect: { kind: "moveCardBetweenZones", source: "life", destination: "hand", count: 1 }
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.life = [{ uid: "last-life", owner: "P1", defId: "demo_rookie", faceUp: false }];
+  game.players.P1.hand.unshift({ uid: "life-loss-card", owner: "P1", defId: "life_loss_event", faceUp: true });
+
+  game = applyAction(game, { type: "playCard", player: "P1", handIndex: 0 });
+
+  assert.equal(game.players.P1.life.length, 0);
+  assert.equal(game.winner, "P2");
+  assert.equal(game.phase, PHASES.GAME_OVER);
+});
+
+test("FAQ regression: Raid clears effects on the base card while newly gained abilities remain distinct from base abilities", () => {
+  const catalog = {
+    ...sampleCatalog,
+    raid_base: {
+      ...sampleCatalog.demo_rookie,
+      id: "raid_base",
+      number: "FAQ-1-063",
+      name: "Raid Base",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      abilities: [{ id: "printed-main", timing: TIMINGS.ACTIVATE_MAIN, effect: { kind: "draw", amount: 1 } }]
+    },
+    raid_top: {
+      ...sampleCatalog.demo_raider,
+      id: "raid_top",
+      number: "FAQ-1-064",
+      name: "Raid Top",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      raid: { names: ["Raid Base"] },
+      abilities: []
+    },
+    lose_base_event: {
+      id: "lose_base_event",
+      number: "FAQ-1-065",
+      sourceCode: "FAQ",
+      name: "Lose Base Event",
+      type: CARD_TYPES.EVENT,
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      affinities: [],
+      eventEffect: {
+        kind: "grantKeyword",
+        keyword: "lostBaseAbilities",
+        duration: "turn",
+        target: { controller: "self", line: LINES.FRONT, max: 1, choiceKey: "loseTarget" }
+      }
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  const base = {
+    pid: "raid-base",
+    owner: "P1",
+    controller: "P1",
+    cards: [{ uid: "raid-base-card", owner: "P1", defId: "raid_base", faceUp: true }],
+    rested: true,
+    bpDelta: 700,
+    bpModifiers: [{ amount: 300, expires: "endOfTurn" }],
+    keywordModifiers: [{ keyword: "impact", value: 1, expires: "endOfTurn" }],
+    energyModifiers: [{ color: "red", amount: 1, expires: "endOfTurn" }],
+    gainedAbilities: [{ id: "gained-main", timing: TIMINGS.ACTIVATE_MAIN, effect: { kind: "draw", amount: 1 } }],
+    readyLocks: 1,
+    playedThisTurn: false,
+    attacksThisTurn: 1,
+    blocksThisTurn: 1,
+    usedOncePerTurn: ["printed-main"]
+  };
+  game.players.P1.frontLine = [base];
+  game.players.P1.hand.unshift({ uid: "raid-top-card", owner: "P1", defId: "raid_top", faceUp: true });
+
+  game = applyAction(game, {
+    type: "performRaid",
+    player: "P1",
+    handIndex: 0,
+    targetLine: LINES.FRONT,
+    targetIndex: 0
+  });
+  const raided = game.players.P1.frontLine[0];
+  assert.equal(raided.bpDelta, 0);
+  assert.deepEqual(raided.bpModifiers, []);
+  assert.deepEqual(raided.keywordModifiers, []);
+  assert.deepEqual(raided.energyModifiers, []);
+  assert.deepEqual(raided.gainedAbilities, []);
+  assert.equal(raided.readyLocks, 0);
+  assert.equal(raided.attacksThisTurn, 0);
+  assert.equal(raided.rested, false);
+
+  raided.cards = [{ uid: "raid-base-card-2", owner: "P1", defId: "raid_base", faceUp: true }];
+  raided.gainedAbilities = [{ id: "gained-main", timing: TIMINGS.ACTIVATE_MAIN, effect: { kind: "draw", amount: 1 } }];
+  game.players.P1.hand.unshift({ uid: "lose-base-card", owner: "P1", defId: "lose_base_event", faceUp: true });
+  game = applyAction(game, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    choices: { loseTarget: [{ player: "P1", lineName: LINES.FRONT, index: 0 }] }
+  });
+  const activateIds = legalActions(game, "P1")
+    .filter((action) => action.type === "activateMainAbility" && action.line === LINES.FRONT)
+    .map((action) => action.abilityId);
+  assert.deepEqual(activateIds, ["gained-main"]);
+});
+
+test("FAQ combat rules encode mandatory attackers, blockers, first attacks, and linked blockers separately", () => {
+  const mustAttack = encodeEgmanCardText({
+    name: "Saitama",
+    category: "Character",
+    effect: "Play this character set to active onto your field. This character must attack if able. [Damage (2)]",
+    trigger: ""
+  }).fields;
+  assert.equal(mustAttack.keywords.mustAttack, true);
+
+  const mustBlock = encodeEgmanCardText({
+    name: "Kasumi Miwa",
+    category: "Character",
+    effect: "[Double Attack] (When this character attacks for the first time this turn, switch it to active.) This character must block your opponent's attacks if able. [When Played] Draw a card.",
+    trigger: ""
+  }).fields;
+  assert.equal(mustBlock.keywords.mustBlockAttacks, true);
+
+  const firstAttack = encodeEgmanCardText({
+    name: "Ken Kaneki",
+    category: "Character",
+    effect: "[When Played] This character gains \"Your opponent must block this character's first attack if able\" until the end of the turn.",
+    trigger: ""
+  }).fields;
+  assert.equal(firstAttack.abilities[0].effect.keyword, "mustBlockFirstAttack");
+
+  const linked = encodeEgmanCardText({
+    name: "Tafuku Mihara",
+    category: "Character",
+    effect: "[Activate: Main] [Once Per Turn] Choose one character with 3000 or less BP on your opponent's front line and one <Hiyuki Kagari> on your front line. The chosen character of your opponent must block the chosen <Hiyuki Kagari> character's attacks if able this turn.",
+    trigger: ""
+  }).fields;
+  assert.equal(linked.abilities[0].effect.kind, "grantMandatoryBlockLink");
+});
+
+test("FAQ regression: characters that must attack are required before optional attackers", () => {
+  const catalog = {
+    ...sampleCatalog,
+    forced_attacker: {
+      ...sampleCatalog.demo_rookie,
+      id: "forced_attacker",
+      number: "FAQ-1-066",
+      name: "Forced Attacker",
+      keywords: { mustAttack: true }
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+  game.players.P1.frontLine = [
+    faqPermanent("forced", "P1", "forced_attacker"),
+    faqPermanent("optional", "P1", "demo_rookie")
+  ];
+
+  let actions = legalActions(game, "P1");
+  assert.equal(actions.some((action) => action.type === "advancePhase"), false);
+  assert.deepEqual([...new Set(actions.filter((action) => action.type === "declareAttack").map((action) => action.attackerIndex))], [0]);
+  assert.throws(() => applyAction(game, {
+    type: "declareAttack",
+    player: "P1",
+    attackerIndex: 1,
+    target: { type: "player" }
+  }), /must attack/i);
+
+  game = applyAction(game, {
+    type: "declareAttack",
+    player: "P1",
+    attackerIndex: 0,
+    target: { type: "player" }
+  });
+  game = applyAction(game, { type: "declineBlock", player: "P2" });
+  actions = legalActions(game, "P1");
+  assert.equal(actions.some((action) => action.type === "advancePhase"), true);
+  assert.equal(actions.some((action) => action.type === "declareAttack" && action.attackerIndex === 1), true);
+});
+
+test("FAQ regression: a mandatory blocker is required only when it can legally block", () => {
+  const catalog = {
+    ...sampleCatalog,
+    forced_blocker: {
+      ...sampleCatalog.demo_blocker,
+      id: "forced_blocker",
+      number: "FAQ-1-067",
+      name: "Forced Blocker",
+      keywords: { mustBlockAttacks: true }
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+  game.players.P1.frontLine = [faqPermanent("attacker", "P1", "demo_rookie")];
+  game.players.P2.frontLine = [
+    faqPermanent("forced-blocker", "P2", "forced_blocker"),
+    faqPermanent("other-blocker", "P2", "demo_blocker")
+  ];
+  game = applyAction(game, {
+    type: "declareAttack",
+    player: "P1",
+    attackerIndex: 0,
+    target: { type: "player" }
+  });
+  let actions = legalActions(game, "P2");
+  assert.deepEqual(actions, [{ type: "declareBlock", player: "P2", blockerIndex: 0 }]);
+  assert.throws(() => applyAction(game, { type: "declineBlock", player: "P2" }), /must block/i);
+
+  game.players.P2.frontLine[0].rested = true;
+  actions = legalActions(game, "P2");
+  assert.equal(actions.some((action) => action.type === "declineBlock"), true);
+  assert.equal(actions.some((action) => action.type === "declareBlock" && action.blockerIndex === 1), true);
+});
+
+test("FAQ regression: linked mandatory blockers apply only to the chosen attacker's attacks", () => {
+  const catalog = {
+    ...sampleCatalog,
+    link_source: {
+      ...sampleCatalog.demo_rookie,
+      id: "link_source",
+      number: "FAQ-1-068",
+      name: "Link Source",
+      abilities: [{
+        id: "link-main",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "grantMandatoryBlockLink",
+          blockerTarget: { controller: "opponent", line: LINES.FRONT, max: 1, choiceKey: "mandatoryBlockerTarget" },
+          attackerTarget: { controller: "self", line: LINES.FRONT, name: "Hiyuki Kagari", max: 1, choiceKey: "mandatoryAttackerTarget" },
+          duration: "turn"
+        }
+      }]
+    },
+    hiyuki: {
+      ...sampleCatalog.demo_rookie,
+      id: "hiyuki",
+      number: "FAQ-1-069",
+      name: "Hiyuki Kagari"
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.frontLine = [
+    faqPermanent("link-source", "P1", "link_source"),
+    faqPermanent("hiyuki", "P1", "hiyuki")
+  ];
+  game.players.P2.frontLine = [
+    faqPermanent("linked-blocker", "P2", "demo_blocker"),
+    faqPermanent("free-blocker", "P2", "demo_blocker")
+  ];
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "link-main",
+    choices: {
+      mandatoryBlockerTarget: [{ player: "P2", lineName: LINES.FRONT, index: 0 }],
+      mandatoryAttackerTarget: [{ player: "P1", lineName: LINES.FRONT, index: 1 }]
+    }
+  });
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+  game = applyAction(game, {
+    type: "declareAttack",
+    player: "P1",
+    attackerIndex: 1,
+    target: { type: "player" }
+  });
+  assert.deepEqual(legalActions(game, "P2"), [{ type: "declareBlock", player: "P2", blockerIndex: 0 }]);
+});
+
+test("FAQ targeting taxes are payable additional costs and respect ability-source scope", () => {
+  const catalog = {
+    ...sampleCatalog,
+    scoped_target: {
+      ...sampleCatalog.demo_guardian,
+      id: "scoped_target",
+      number: "FAQ-1-070",
+      name: "Scoped Target",
+      targetingRestrictions: [{
+        mode: "tax",
+        sourceTypes: [CARD_TYPES.CHARACTER, CARD_TYPES.EVENT],
+        payment: { kind: "ap", amount: 1 }
+      }]
+    },
+    target_source: {
+      ...sampleCatalog.demo_rookie,
+      id: "target_source",
+      number: "FAQ-1-071",
+      name: "Target Source",
+      abilities: [{
+        id: "target-main",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "modifyBp",
+          amount: -500,
+          duration: "turn",
+          target: { controller: "opponent", line: LINES.FRONT, min: 1, max: 1, choiceKey: "taxedTarget" }
+        }
+      }]
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.frontLine = [faqPermanent("tax-source", "P1", "target_source")];
+  game.players.P2.frontLine = [faqPermanent("tax-target", "P2", "scoped_target")];
+  assert.equal(game.players.P1.apCards.filter((ap) => !ap.rested).length, 1);
+
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "target-main",
+    choices: { taxedTarget: [{ player: "P2", lineName: LINES.FRONT, index: 0 }] }
+  });
+  assert.equal(game.players.P1.apCards.filter((ap) => !ap.rested).length, 0);
+  assert.equal(internals.battlePower(game, game.players.P2.frontLine[0]), 2500);
+});
+
+test("FAQ targeting prohibitions distinguish event abilities from character abilities and honor choosing zero", () => {
+  const catalog = {
+    ...sampleCatalog,
+    event_protected: {
+      ...sampleCatalog.demo_guardian,
+      id: "event_protected",
+      number: "FAQ-1-072",
+      name: "Event Protected",
+      targetingRestrictions: [{ mode: "prohibit", sourceTypes: [CARD_TYPES.EVENT] }]
+    },
+    character_targeter: {
+      ...sampleCatalog.demo_rookie,
+      id: "character_targeter",
+      number: "FAQ-1-073",
+      name: "Character Targeter",
+      abilities: [{
+        id: "character-target",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "modifyBp",
+          amount: -500,
+          duration: "turn",
+          target: { controller: "opponent", line: LINES.FRONT, min: 1, max: 1, choiceKey: "characterTarget" }
+        }
+      }]
+    },
+    event_targeter: {
+      id: "event_targeter",
+      number: "FAQ-1-074",
+      sourceCode: "FAQ",
+      name: "Event Targeter",
+      type: CARD_TYPES.EVENT,
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      affinities: [],
+      eventEffect: {
+        kind: "modifyBp",
+        amount: -500,
+        duration: "turn",
+        target: { controller: "opponent", line: LINES.FRONT, min: 0, max: 1, choiceKey: "eventTarget" }
+      }
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.frontLine = [faqPermanent("character-targeter", "P1", "character_targeter")];
+  game.players.P2.frontLine = [faqPermanent("event-protected", "P2", "event_protected")];
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "character-target",
+    choices: { characterTarget: [{ player: "P2", lineName: LINES.FRONT, index: 0 }] }
+  });
+  assert.equal(internals.battlePower(game, game.players.P2.frontLine[0]), 2500);
+
+  game.players.P1.hand.unshift({ uid: "event-targeter-card", owner: "P1", defId: "event_targeter", faceUp: true });
+  game = applyAction(game, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    choices: { eventTarget: [] }
+  });
+  assert.equal(internals.battlePower(game, game.players.P2.frontLine[0]), 2500);
+});
+
+test("FAQ removal protection stops opponent abilities but not zero-BP rules processing", () => {
+  const catalog = {
+    ...sampleCatalog,
+    removal_protected: {
+      ...sampleCatalog.demo_rookie,
+      id: "removal_protected",
+      number: "FAQ-1-075",
+      name: "Removal Protected",
+      opponentAbilityRemovalProtection: true
+    },
+    removal_source: {
+      ...sampleCatalog.demo_rookie,
+      id: "removal_source",
+      number: "FAQ-1-076",
+      name: "Removal Source",
+      abilities: [{
+        id: "remove-main",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "sidelineTargets",
+          target: { controller: "opponent", line: LINES.FRONT, min: 1, max: 1, choiceKey: "removeTarget" }
+        }
+      }, {
+        id: "reduce-main",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "modifyBp",
+          amount: -2000,
+          duration: "turn",
+          target: { controller: "opponent", line: LINES.FRONT, min: 1, max: 1, choiceKey: "reduceTarget" }
+        }
+      }]
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.frontLine = [faqPermanent("removal-source", "P1", "removal_source")];
+  game.players.P2.frontLine = [faqPermanent("removal-protected", "P2", "removal_protected")];
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "remove-main",
+    choices: { removeTarget: [{ player: "P2", lineName: LINES.FRONT, index: 0 }] }
+  });
+  assert.equal(game.players.P2.frontLine.length, 1);
+
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "reduce-main",
+    choices: { reduceTarget: [{ player: "P2", lineName: LINES.FRONT, index: 0 }] }
+  });
+  assert.equal(game.players.P2.frontLine.length, 0);
+  assert.equal(game.players.P2.sideline.some((item) => item.uid === "removal-protected-card"), true);
+});
+
+test("FAQ return protection stops either player's abilities without preventing other zone removal", () => {
+  const catalog = {
+    ...sampleCatalog,
+    return_protected: {
+      ...sampleCatalog.demo_rookie,
+      id: "return_protected",
+      number: "FAQ-1-077",
+      name: "Return Protected",
+      abilityReturnToHandProtection: true
+    },
+    return_source: {
+      ...sampleCatalog.demo_rookie,
+      id: "return_source",
+      number: "FAQ-1-078",
+      name: "Return Source",
+      abilities: [{
+        id: "return-main",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "returnTargetsToHand",
+          target: { controller: "self", line: LINES.FRONT, min: 1, max: 1, choiceKey: "returnTarget" }
+        }
+      }, {
+        id: "sideline-main",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "sidelineTargets",
+          target: { controller: "self", line: LINES.FRONT, min: 1, max: 1, choiceKey: "sidelineTarget" }
+        }
+      }]
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.frontLine = [
+    faqPermanent("return-source", "P1", "return_source"),
+    faqPermanent("return-protected", "P1", "return_protected")
+  ];
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "return-main",
+    choices: { returnTarget: [{ player: "P1", lineName: LINES.FRONT, index: 1 }] }
+  });
+  assert.equal(game.players.P1.frontLine.some((item) => item.pid === "return-protected"), true);
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "sideline-main",
+    choices: { sidelineTarget: [{ player: "P1", lineName: LINES.FRONT, index: 1 }] }
+  });
+  assert.equal(game.players.P1.frontLine.some((item) => item.pid === "return-protected"), false);
+  assert.equal(game.players.P1.sideline.some((item) => item.uid === "return-protected-card"), true);
+});
+
+test("FAQ regression: multi-card play effects make room first, play simultaneously, then order When Played abilities", () => {
+  const encoded = encodeEgmanCardText({
+    name: "Mini Mechamaru",
+    category: "Event",
+    effect: "Draw a card. Play up to two red character cards with 3 or less required energy, 1 AP cost, and [Jujutsu Sorcerer] affinity from your hand set to resting onto your field.",
+    trigger: ""
+  }).fields;
+  const playEffect = encoded.eventEffect.effects.find((effect) => effect.kind === "playCardFromZone");
+  assert.equal(playEffect.count, 2);
+  assert.equal(playEffect.simultaneous, true);
+
+  const catalog = {
+    ...sampleCatalog,
+    simultaneous_a: {
+      ...sampleCatalog.demo_rookie,
+      id: "simultaneous_a",
+      number: "FAQ-1-079",
+      name: "Simultaneous A",
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 1,
+      affinities: ["Jujutsu Sorcerer"],
+      abilities: [{
+        id: "boost-b",
+        timing: TIMINGS.WHEN_PLAYED,
+        effect: {
+          kind: "modifyBp",
+          amount: 500,
+          duration: "turn",
+          target: { controller: "self", line: LINES.FRONT, name: "Simultaneous B", min: 1, max: 1 }
+        }
+      }]
+    },
+    simultaneous_b: {
+      ...sampleCatalog.demo_rookie,
+      id: "simultaneous_b",
+      number: "FAQ-1-080",
+      name: "Simultaneous B",
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 1,
+      affinities: ["Jujutsu Sorcerer"]
+    },
+    simultaneous_event: {
+      id: "simultaneous_event",
+      number: "FAQ-1-081",
+      sourceCode: "FAQ",
+      name: "Simultaneous Event",
+      type: CARD_TYPES.EVENT,
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      affinities: [],
+      eventEffect: {
+        kind: "playCardFromZone",
+        zones: ["hand"],
+        count: 2,
+        simultaneous: true,
+        rested: true,
+        destinationLine: LINES.FRONT,
+        choiceKey: "playZoneIndex",
+        filter: { type: CARD_TYPES.CHARACTER, color: "red", affinity: "Jujutsu Sorcerer" }
+      }
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.frontLine = [
+    faqPermanent("existing-1", "P1", "demo_rookie"),
+    faqPermanent("existing-2", "P1", "demo_rookie"),
+    faqPermanent("existing-3", "P1", "demo_rookie"),
+    faqPermanent("existing-4", "P1", "demo_rookie")
+  ];
+  game.players.P1.hand = [
+    { uid: "sim-event", owner: "P1", defId: "simultaneous_event", faceUp: true },
+    { uid: "sim-a", owner: "P1", defId: "simultaneous_a", faceUp: true },
+    { uid: "sim-b", owner: "P1", defId: "simultaneous_b", faceUp: true }
+  ];
+  game = applyAction(game, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    choices: {
+      playZoneIndex: [0, 1],
+      replaceIndices: [0, 0],
+      simultaneousPlayedOrder: [0, 1]
+    }
+  });
+  assert.equal(game.players.P1.frontLine.length, 4);
+  assert.equal(game.players.P1.removal.some((item) => item.uid === "existing-1-card"), true);
+  assert.equal(game.players.P1.removal.some((item) => item.uid === "existing-2-card"), true);
+  const playedB = game.players.P1.frontLine.find((permanent) => permanent.cards.at(-1).defId === "simultaneous_b");
+  assert.ok(playedB);
+  assert.equal(internals.battlePower(game, playedB), 2000);
 });
 
 test("FAQ regression: field assist changes choose-one into two distinct choices", () => {
@@ -412,6 +1128,7 @@ test("FAQ regression: field assist changes choose-one into two distinct choices"
     abilityId: "choose-main",
     choices: { effectChoices: [0, 0] }
   }), /same effect branch cannot be chosen/i);
+
 });
 
 test("FAQ regression: optional cost choose-two upgrade requires distinct choices", () => {
@@ -483,6 +1200,18 @@ test("FAQ regression: optional cost choose-two upgrade requires distinct choices
     destination: LINES.FRONT,
     choices: { effectChoices: [0, 0] }
   }), /same effect branch cannot be chosen/i);
+
+  const noCostGame = mainPhaseGame(catalog);
+  noCostGame.players.P1.hand = [
+    { uid: "upgrade-source-card-3", owner: "P1", defId: "optional_upgrade_source", faceUp: true }
+  ];
+  assert.doesNotThrow(() => applyAction(noCostGame, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    destination: LINES.FRONT,
+    choices: { effectChoice: 0 }
+  }));
 });
 
 test("FAQ regression: color-trigger replacement happens once even with multiple copies", () => {
@@ -669,6 +1398,89 @@ test("FAQ regression: normal color triggers play Raid cards normally instead of 
   assert.equal(game.players.P1.frontLine[1].cards.length, 1);
   assert.equal(game.players.P1.frontLine[1].cards[0].uid, "color-raid-card");
   assert.equal(game.players.P1.frontLine[1].rested, false);
+});
+
+test("FAQ regression: Raid triggers may perform Raid and ready the matching base", () => {
+  const catalog = {
+    ...sampleCatalog,
+    raid_trigger_base: {
+      ...sampleCatalog.demo_rookie,
+      id: "raid_trigger_base",
+      number: "FAQ-RAID-BASE",
+      name: "Raid Trigger Base",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0
+    },
+    raid_trigger_card: {
+      ...sampleCatalog.demo_raider,
+      id: "raid_trigger_card",
+      number: "FAQ-RAID-TRIGGER",
+      name: "Raid Trigger Card",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 0,
+      raid: { names: ["Raid Trigger Base"], affinities: [] },
+      trigger: { type: "raid" }
+    }
+  };
+  const game = mainPhaseGame(catalog);
+  game.activePlayer = "P2";
+  game.players.P1.frontLine = [faqPermanent("raid-trigger-base", "P1", "raid_trigger_base", true)];
+  game.players.P1.life = [
+    { uid: "raid-trigger-life", owner: "P1", defId: "raid_trigger_card", faceUp: false },
+    { uid: "remaining-life", owner: "P1", defId: "demo_rookie", faceUp: false }
+  ];
+
+  internals.dealDamage(game, "P1", 1, {
+    sourcePlayer: "P2",
+    lifeIndices: [0],
+    triggerChoices: [{
+      choices: {
+        performRaid: true,
+        raidTarget: { lineName: LINES.FRONT, index: 0 }
+      }
+    }]
+  });
+
+  assert.equal(game.players.P1.frontLine[0].cards.length, 2);
+  assert.equal(game.players.P1.frontLine[0].cards.at(-1).defId, "raid_trigger_card");
+  assert.equal(game.players.P1.frontLine[0].rested, false);
+  assert.equal(game.players.P1.hand.some((card) => card.uid === "raid-trigger-life"), false);
+});
+
+test("FAQ regression: next-ready prevention is consumed only by the next ready attempt", () => {
+  const catalog = {
+    ...sampleCatalog,
+    active_trigger_life: {
+      ...sampleCatalog.demo_rookie,
+      id: "active_trigger_life",
+      number: "FAQ-ACTIVE-TRIGGER",
+      name: "Active Trigger Life",
+      trigger: { type: "active" }
+    }
+  };
+  let game = mainPhaseGame(catalog);
+  const locked = faqPermanent("ready-locked", "P2", "demo_guardian", true);
+  locked.readyLocks = 1;
+  game.players.P2.frontLine = [locked];
+  game.players.P2.life = [
+    { uid: "active-trigger-life", owner: "P2", defId: "active_trigger_life", faceUp: false },
+    { uid: "remaining-life", owner: "P2", defId: "demo_rookie", faceUp: false }
+  ];
+
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+
+  assert.equal(game.activePlayer, "P2");
+  assert.equal(game.players.P2.frontLine[0].rested, true);
+  assert.equal(game.players.P2.frontLine[0].readyLocks, 0);
+
+  internals.dealDamage(game, "P2", 1, {
+    sourcePlayer: "P1",
+    lifeIndices: [0],
+    triggerChoices: [true]
+  });
+  assert.equal(game.players.P2.frontLine[0].rested, false);
 });
 
 test("FAQ regression: shared once-per-turn attack restriction applies only to the first attacking copy", () => {
@@ -1038,4 +1850,71 @@ test("FAQ regression: EVA-1-033 style Activate Main lets controller order source
     }
   });
   assert.deepEqual(game.players.P1.hand.map((card) => card.defId), ["high_a", "high_b", "low_a"]);
+});
+
+test("FAQ regression: partial zone payment moves available cards but does not resolve If-you-do payoff", () => {
+  const encoded = encodeEgmanCardText({
+    category: "Event",
+    name: "Partial Payment",
+    effect: "You may place four cards from your sideline into your removal area. If you do, draw two cards.",
+    trigger: ""
+  }).fields;
+  const event = {
+    id: "partial_payment",
+    number: "FAQ-PARTIAL-PAYMENT",
+    sourceCode: "FAQ",
+    name: "Partial Payment",
+    type: CARD_TYPES.EVENT,
+    color: "green",
+    requiredEnergy: { color: "green", amount: 0 },
+    apCost: 0,
+    affinities: [],
+    eventEffect: encoded.eventEffect
+  };
+  const catalog = { ...sampleCatalog, partial_payment: event };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.hand = [{ uid: "partial-event", owner: "P1", defId: event.id, faceUp: true }];
+  game.players.P1.sideline = [
+    { uid: "partial-a", owner: "P1", defId: "demo_rookie", faceUp: true },
+    { uid: "partial-b", owner: "P1", defId: "demo_rookie", faceUp: true },
+    { uid: "partial-c", owner: "P1", defId: "demo_rookie", faceUp: true }
+  ];
+  const deckBefore = game.players.P1.deck.length;
+
+  game = applyAction(game, { type: "playCard", player: "P1", handIndex: 0 });
+
+  assert.equal(game.players.P1.removal.length, 3);
+  assert.equal(game.players.P1.deck.length, deckBefore);
+  assert.equal(game.players.P1.hand.length, 0);
+});
+
+test("FAQ regression: an optional hand payment that cannot be made declines without throwing", () => {
+  const encoded = encodeEgmanCardText({
+    category: "Event",
+    name: "Unpayable Hand Cost",
+    effect: "You may place two cards from your hand into your sideline. If you do, draw three cards.",
+    trigger: ""
+  }).fields;
+  const event = {
+    id: "unpayable_hand_cost",
+    number: "FAQ-HAND-PAYMENT",
+    sourceCode: "FAQ",
+    name: "Unpayable Hand Cost",
+    type: CARD_TYPES.EVENT,
+    color: "green",
+    requiredEnergy: { color: "green", amount: 0 },
+    apCost: 0,
+    affinities: [],
+    eventEffect: encoded.eventEffect
+  };
+  const catalog = { ...sampleCatalog, unpayable_hand_cost: event };
+  let game = mainPhaseGame(catalog);
+  game.players.P1.hand = [{ uid: "hand-cost-event", owner: "P1", defId: event.id, faceUp: true }];
+  const deckBefore = game.players.P1.deck.length;
+
+  assert.doesNotThrow(() => {
+    game = applyAction(game, { type: "playCard", player: "P1", handIndex: 0 });
+  });
+  assert.equal(game.players.P1.deck.length, deckBefore);
+  assert.equal(game.players.P1.hand.length, 0);
 });

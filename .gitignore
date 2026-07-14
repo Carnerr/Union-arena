@@ -5,6 +5,7 @@ npm-debug.log*
 # Local/private data and generated output
 work/
 outputs/
+tmp/
 
 # Codex/local workspace metadata
 .agents/

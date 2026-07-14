@@ -28,6 +28,7 @@ export const TRIGGER_TYPES = Object.freeze({
   ACTIVE: "active",
   SPECIAL: "special",
   COLOR: "color",
+  RAID: "raid",
   FINAL: "final"
 });
 
@@ -57,6 +58,7 @@ export const TIMINGS = Object.freeze({
   WHEN_OPPONENT_CHARACTER_SIDELINED: "whenOpponentCharacterSidelined",
   WHEN_OWN_CHARACTER_MOVES_OUTSIDE_MOVEMENT_PHASE: "whenOwnCharacterMovesOutsideMovementPhase",
   WHEN_OPPONENT_ACTIVATE_MAIN_ABILITY: "whenOpponentActivateMainAbility",
+  WHEN_BP_INCREASED: "whenBpIncreased",
   WHEN_RAIDED: "whenRaided",
   START_OF_TURN: "startOfTurn",
   START_OF_ATTACK_PHASE: "startOfAttackPhase",

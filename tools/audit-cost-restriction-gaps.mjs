@@ -124,13 +124,33 @@ function classify(text) {
   if (/can only be played from your hand\b/.test(text)) {
     categories.push({ kind: "onlyPlayedFromHandRestriction", pattern: "can only be played from your hand" });
   }
+  const sidelineRemovalPattern = /(?:may\s+)?place\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+(?:character\s+)?cards?\s+from\s+your\s+sideline\s+into\s+your\s+removal\s+area\.\s*if\s+you\s+do\b/g;
+  for (const match of text.matchAll(sidelineRemovalPattern)) {
+    categories.push({
+      kind: "sidelineRemovalIfDoGate",
+      pattern: match[0],
+      requiredCount: numberValue(match[1])
+    });
+  }
   return categories;
 }
 
 function describeEncoding(def) {
   const effectKinds = [];
-  walkEffectTree(def?.eventEffect, (effect) => effectKinds.push(effect.kind));
-  for (const ability of def?.abilities ?? []) walkEffectTree(ability.effect, (effect) => effectKinds.push(effect.kind));
+  const movementGates = [];
+  const inspectEffect = (effect) => {
+    effectKinds.push(effect.kind);
+    if (effect.requiredMovedCountForFollowing == null) return;
+    movementGates.push({
+      kind: effect.kind,
+      sourceZone: effect.sourceZone ?? effect.source,
+      destinationZone: effect.destinationZone ?? effect.destination,
+      count: effect.count,
+      requiredMovedCountForFollowing: effect.requiredMovedCountForFollowing
+    });
+  };
+  walkEffectTree(def?.eventEffect, inspectEffect);
+  for (const ability of def?.abilities ?? []) walkEffectTree(ability.effect, inspectEffect);
   return {
     hasDefinition: Boolean(def),
     useCostModifiers: (def?.useCostModifiers ?? []).map((modifier) => ({
@@ -149,6 +169,7 @@ function describeEncoding(def) {
       condition: modifier.condition
     })),
     useRestrictionCount: effectKinds.filter((kind) => kind === "replacementOrUseRestriction").length,
+    movementGates,
     effectKinds
   };
 }
@@ -168,9 +189,32 @@ function categoryEncoded(category, encoded) {
     case "onlyUseRestriction":
     case "onlyPlayedFromHandRestriction":
       return encoded.useRestrictionCount > 0;
+    case "sidelineRemovalIfDoGate":
+      return encoded.movementGates.some((gate) =>
+        gate.kind === "moveCardBetweenZones"
+        && gate.sourceZone === "sideline"
+        && gate.destinationZone === "removal"
+        && gate.requiredMovedCountForFollowing === category.requiredCount
+      );
     default:
       return false;
   }
+}
+
+function numberValue(value) {
+  const words = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10
+  };
+  return words[value] ?? Number(value);
 }
 
 function walkEffectTree(effect, callback) {
@@ -178,6 +222,12 @@ function walkEffectTree(effect, callback) {
   callback(effect);
   if (effect.effect) walkEffectTree(effect.effect, callback);
   if (effect.elseEffect) walkEffectTree(effect.elseEffect, callback);
+  if (effect.baseEffect) walkEffectTree(effect.baseEffect, callback);
+  if (effect.costEffect) walkEffectTree(effect.costEffect, callback);
+  if (effect.insteadEffect) walkEffectTree(effect.insteadEffect, callback);
+  if (effect.upgradedEffect) walkEffectTree(effect.upgradedEffect, callback);
+  if (effect.ifMovedEffect) walkEffectTree(effect.ifMovedEffect, callback);
+  if (effect.successEffect) walkEffectTree(effect.successEffect, callback);
   for (const child of effect.effects ?? []) walkEffectTree(child, callback);
   for (const choice of effect.choices ?? []) walkEffectTree(choice.effect, callback);
 }

@@ -113,6 +113,8 @@ Current reusable effect kinds:
 - `draw`, `drawOpponent`: draw cards.
 - `lookTopDeck`: log a top-deck look for local simulation.
 - `searchTopDeck`: look at top deck cards, add matching cards to a zone, and bottom the rest.
+  - Add `publicReveal: true` when the whole looked group was revealed publicly, such as "Reveal the top two cards..."
+  - Add `revealSelected: true` when the player looked privately but only the selected card was revealed, such as "Look at the top three cards... Reveal up to one... and add it to your hand."
 - `moveTopDeck`: move cards from deck to `hand`, `life`, `sideline`, or `removal`.
 - `placeTopDeckUnderSelf`: place deck cards under the source permanent.
 - `moveUnderCardsToZone`: move cards under a permanent to `hand`, `sideline`, or another private zone.

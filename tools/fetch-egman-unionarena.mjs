@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { writeJsonAtomicSync } from "../src/artifact-io.js";
 import { normalizeCatalog, parseKeywordEffects, validateCatalog } from "../src/catalog.js";
 import { cleanUnionArenaText, encodeEgmanCardText } from "../src/effect-text.js";
 
@@ -78,7 +79,7 @@ function valueAfter(flag) {
 
 function writeJson(path, value) {
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+  writeJsonAtomicSync(path, value);
 }
 
 function toImportRow(card) {
@@ -88,11 +89,14 @@ function toImportRow(card) {
   const trigger = cleanUnionArenaText(card.trigger);
   const keywordEffect = [effect, trigger].join(" ");
   const encoded = encodeEgmanCardText(card).fields;
-  const keywords = { ...parseKeywordEffects(keywordEffect), ...(encoded.keywords ?? {}) };
+  const keywords = encoded.replaceParsedKeywords
+    ? { ...(encoded.keywords ?? {}) }
+    : { ...parseKeywordEffects(keywordEffect), ...(encoded.keywords ?? {}) };
   const row = {
     id: sanitizeId(card.card_code ?? card.id),
     cardNumber: card.card_code,
     cardName: card.name,
+    alternateNames: encoded.alternateNames ?? [],
     cardType: card.category ?? card.type,
     title: card.set,
     sourceCode: card.set_code ?? sourceCodeFromCardCode(card.card_code),
@@ -121,9 +125,21 @@ function toImportRow(card) {
     choiceModeAssists: encoded.choiceModeAssists ?? [],
     triggerReplacements: encoded.triggerReplacements ?? [],
     gainsBaseAbilityTimings: encoded.gainsBaseAbilityTimings ?? [],
+    deckCopyLimit: encoded.deckCopyLimit,
+    maximumHandSize: encoded.maximumHandSize,
+    lineCapacityModifiers: encoded.lineCapacityModifiers ?? [],
+    targetingRestrictions: encoded.targetingRestrictions ?? [],
+    abilityProtections: encoded.abilityProtections ?? [],
+    raidTargetPermissions: encoded.raidTargetPermissions ?? [],
+    raidUseCondition: encoded.raidUseCondition,
+    raidOnlyPlay: encoded.raidOnlyPlay ?? false,
     returnRaidStackToHandOnReturn: encoded.returnRaidStackToHandOnReturn ?? false,
     sidelineTopRaidCardInstead: encoded.sidelineTopRaidCardInstead ?? false,
     battleLosersToRemovalInstead: encoded.battleLosersToRemovalInstead ?? false,
+    battleLosersToEnergyInstead: encoded.battleLosersToEnergyInstead ?? false,
+    freeExtraDrawFromFrontLine: encoded.freeExtraDrawFromFrontLine ?? false,
+    selfTriggerAlternatives: encoded.selfTriggerAlternatives ?? [],
+    opponentAbilityLeaveReplacement: encoded.opponentAbilityLeaveReplacement,
     returnToHandHandSidelineInstead: encoded.returnToHandHandSidelineInstead ?? false,
     topRaidCardToSidelineInsteadOnOpponentLeave: encoded.topRaidCardToSidelineInsteadOnOpponentLeave ?? false,
     topRaidReplacementBaseRequiredEnergyMin: encoded.topRaidReplacementBaseRequiredEnergyMin,
@@ -131,6 +147,14 @@ function toImportRow(card) {
     moveToEnergyInsteadOnOpponentAbilityLeave: encoded.moveToEnergyInsteadOnOpponentAbilityLeave ?? false,
     moveToEnergyInsteadOnOpponentAbilityBpReduction: encoded.moveToEnergyInsteadOnOpponentAbilityBpReduction ?? false,
     cannotEnterFrontLine: encoded.cannotEnterFrontLine ?? false,
+    cannotEnterEnergyLine: encoded.cannotEnterEnergyLine ?? false,
+    cannotPlayToFrontLine: encoded.cannotPlayToFrontLine ?? false,
+    cannotPlayToEnergyLine: encoded.cannotPlayToEnergyLine ?? false,
+    cannotMoveDuringMovementPhase: encoded.cannotMoveDuringMovementPhase ?? false,
+    frontLineMoveByOwnAbilityOnly: encoded.frontLineMoveByOwnAbilityOnly ?? false,
+    frontLineEntryCondition: encoded.frontLineEntryCondition,
+    opponentAbilityRemovalProtection: encoded.opponentAbilityRemovalProtection ?? false,
+    abilityReturnToHandProtection: encoded.abilityReturnToHandProtection ?? false,
     entersActive: encoded.entersActive ?? false,
     entersActiveCondition: encoded.entersActiveCondition,
     raid: encoded.raid

@@ -86,13 +86,11 @@ function valueAfter(flag) {
 function collectEffectKinds(effect, counts) {
   if (!effect) return;
   increment(counts, effect.kind ?? "unknown");
-  if (effect.kind === "sequence") {
-    for (const child of effect.effects ?? []) collectEffectKinds(child, counts);
+  for (const key of ["effect", "elseEffect", "baseEffect", "costEffect", "insteadEffect", "upgradedEffect", "ifMovedEffect", "successEffect"]) {
+    collectEffectKinds(effect[key], counts);
   }
-  if (effect.kind === "optional") collectEffectKinds(effect.effect, counts);
-  if (effect.kind === "chooseOne") {
-    for (const choice of effect.choices ?? []) collectEffectKinds(choice.effect, counts);
-  }
+  for (const child of effect.effects ?? []) collectEffectKinds(child, counts);
+  for (const choice of effect.choices ?? []) collectEffectKinds(choice.effect, counts);
 }
 
 function increment(record, key) {

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   CARD_TYPES,
   LINES,
+  MAX_LINE_SIZE,
   PHASES,
   TIMINGS,
   applyAction,
@@ -34,6 +35,61 @@ function testPermanent(pid, owner, defId, rested = false) {
 
 function topDefId(permanent) {
   return permanent.cards.at(-1).defId;
+}
+
+test("static rules encode deck limits, hand size, line capacity, and line-entry restrictions", () => {
+  const beach = encodeEgmanCardText({
+    name: "Strip of Beach",
+    category: "Site",
+    effect: "A deck can only contain up to three copies of this card. Your maximum hand size is now 15 cards. [When Played] Draw a card.",
+    trigger: ""
+  }).fields;
+  assert.equal(beach.deckCopyLimit, 3);
+  assert.equal(beach.maximumHandSize, 15);
+
+  const titan = encodeEgmanCardText({
+    name: "Colossal Titan",
+    category: "Character",
+    effect: "This card cannot be played onto your energy line. [If on the Front Line] The number of cards you can place onto your front line is reduced by one.",
+    trigger: ""
+  }).fields;
+  assert.equal(titan.cannotPlayToEnergyLine, true);
+  assert.deepEqual(titan.lineCapacityModifiers, [{
+    line: LINES.FRONT,
+    amount: -1,
+    condition: { line: LINES.FRONT }
+  }]);
+
+  const hiko = encodeEgmanCardText({
+    name: "Seijuro Hiko",
+    category: "Character",
+    effect: "This card cannot be played onto your front line and can only be moved to your front line using its ability.",
+    trigger: ""
+  }).fields;
+  assert.equal(hiko.cannotPlayToFrontLine, true);
+  assert.equal(hiko.frontLineMoveByOwnAbilityOnly, true);
+
+  const muzan = encodeEgmanCardText({
+    name: "Muzan Kibutsuji",
+    category: "Character",
+    effect: "This character cannot be played onto or moved to your front line unless you have 20 or more cards in your sideline.",
+    trigger: ""
+  }).fields;
+  assert.equal(muzan.cannotEnterFrontLine, undefined);
+  assert.deepEqual(muzan.frontLineEntryCondition, { sidelineCountMin: 20 });
+});
+
+function flattenEffectTree(effect) {
+  if (!effect || typeof effect !== "object") return [];
+  return [
+    effect,
+    ...(effect.effects ?? []).flatMap(flattenEffectTree),
+    ...flattenEffectTree(effect.effect),
+    ...flattenEffectTree(effect.elseEffect),
+    ...flattenEffectTree(effect.ifMovedEffect),
+    ...flattenEffectTree(effect.successEffect),
+    ...(effect.choices ?? []).flatMap((choice) => flattenEffectTree(choice.effect))
+  ];
 }
 
 test("normalizes private card rows into engine card definitions", () => {
@@ -233,7 +289,11 @@ test("EGM encoder handles field attack triggered support abilities", () => {
   const kaiselChoice = kaisel.fields.abilities[0].effect.effect.effects[1].choices[1].effect;
   assert.deepEqual(kaiselChoice, {
     kind: "grantKeyword",
-    keyword: "opponentAbilityProtection",
+    keyword: "targetingRestriction",
+    value: {
+      mode: "prohibit",
+      sourceTypes: [CARD_TYPES.CHARACTER, CARD_TYPES.EVENT, CARD_TYPES.SITE, "trigger"]
+    },
     duration: "turn",
     target: { type: CARD_TYPES.CHARACTER, max: 1, attacking: true }
   });
@@ -406,7 +466,12 @@ test("EGM encoder handles self deck-to-sideline zone triggers", () => {
     timing: TIMINGS.WHEN_SELF_DECK_TO_SIDELINE_BY_ABILITY,
     oncePerTurn: false,
     conditions: { zone: "sideline" },
-    effect: { kind: "draw", amount: 1 }
+    effect: {
+      kind: "optional",
+      choiceKey: "optionalDraw",
+      default: true,
+      effect: { kind: "draw", amount: 1 }
+    }
   }]);
 
   const raid = encodeEgmanCardText({
@@ -713,6 +778,54 @@ test("searchTopDeck moves matching cards to hand and bottoms the rest", () => {
   assert.deepEqual(game.players.P1.deck.map((card) => card.defId), ["demo_rookie", "demo_guardian"]);
 });
 
+test("searchTopDeck reveal-selected records only the card shown to the opponent", () => {
+  const catalog = {
+    ...sampleCatalog,
+    reveal_selected_event: {
+      id: "reveal_selected_event",
+      number: "DEM-1-098",
+      sourceCode: "DEM",
+      name: "Reveal Selected Event",
+      type: CARD_TYPES.EVENT,
+      color: "green",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      affinities: [],
+      eventEffect: {
+        kind: "searchTopDeck",
+        count: 3,
+        max: 1,
+        destination: "hand",
+        revealSelected: true,
+        filter: { type: CARD_TYPES.CHARACTER, otherThanName: "Demo Rookie" }
+      }
+    }
+  };
+
+  let game = createGame({
+    catalog,
+    decks: { P1: sampleDeckList, P2: sampleDeckList },
+    skipShuffle: true,
+    validateDecks: false
+  });
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+  game = applyAction(game, { type: "advancePhase", player: "P1" });
+
+  game.players.P1.hand.unshift({ uid: "reveal-selected-event-ref", owner: "P1", defId: "reveal_selected_event", faceUp: true });
+  game.players.P1.deck = [
+    { uid: "reveal-selected-1", owner: "P1", defId: "demo_rookie", faceUp: true },
+    { uid: "reveal-selected-2", owner: "P1", defId: "demo_stepper", faceUp: true },
+    { uid: "reveal-selected-3", owner: "P1", defId: "demo_guardian", faceUp: true }
+  ];
+
+  game = applyAction(game, { type: "playCard", player: "P1", handIndex: 0 });
+
+  assert.deepEqual(
+    game.publicKnowledge.P2.players.P1.revealedCards.map((card) => card.defId),
+    ["demo_stepper"]
+  );
+});
+
 test("look-top deck arrangement can move cards to bottom or sideline", () => {
   const encoded = encodeEgmanCardText({
     name: "Private Arrange Event",
@@ -814,6 +927,7 @@ test("look-top deck distribution can move cards to hand, sideline, and bottom", 
     trigger: ""
   }).fields.abilities[0].effect;
   assert.equal(revealEncoded.kind, "searchTopDeck");
+  assert.equal(revealEncoded.publicReveal, true);
   assert.equal(revealEncoded.remainingDestination, "sideline");
 
   const revealTopThree = encodeEgmanCardText({
@@ -824,6 +938,7 @@ test("look-top deck distribution can move cards to hand, sideline, and bottom", 
   }).fields.abilities[0].effect;
   assert.equal(revealTopThree.kind, "sequence");
   assert.equal(revealTopThree.effects[0].kind, "searchTopDeck");
+  assert.equal(revealTopThree.effects[0].publicReveal, true);
   assert.equal(revealTopThree.effects[0].count, 3);
   assert.equal(revealTopThree.effects[0].remainingDestination, "sideline");
   assert.deepEqual(revealTopThree.effects[0].filter.anyOf, [
@@ -860,6 +975,16 @@ test("look-top deck distribution can move cards to hand, sideline, and bottom", 
   assert.equal(playFromLooked.kind, "lookTopDeckPlayOneAndMoveRest");
   assert.equal(playFromLooked.rested, true);
   assert.equal(playFromLooked.remainingDestination, "bottom");
+
+  const selectedReveal = encodeEgmanCardText({
+    name: "Private Selected Reveal",
+    category: "Character",
+    effect: "[When Played] Look at the top three cards of your deck. Reveal up to one character card among them and add it to your hand. Place the remaining cards on the bottom of your deck in any order.",
+    trigger: ""
+  }).fields.abilities[0].effect;
+  assert.equal(selectedReveal.kind, "searchTopDeck");
+  assert.equal(selectedReveal.revealSelected, true);
+  assert.equal(selectedReveal.publicReveal, undefined);
 
   const catalog = {
     ...sampleCatalog,
@@ -933,6 +1058,7 @@ test("EGM encoder handles reveal-top deck arrangement", () => {
   });
   assert.equal(encoded.coverage.unsupported.length, 0);
   assert.equal(encoded.fields.abilities[0].effect.kind, "lookTopDeckAndMove");
+  assert.equal(encoded.fields.abilities[0].effect.publicReveal, true);
   assert.deepEqual(encoded.fields.abilities[0].effect.destinations, ["top", "bottom"]);
 });
 
@@ -985,6 +1111,8 @@ test("EGM encoder handles front-energy swap templates", () => {
   });
   assert.equal(massMoveOrSwap.coverage.unsupported.length, 0);
   assert.deepEqual(massMoveOrSwap.fields.eventEffect.effects.map((effect) => effect.kind), ["moveOrSwapTargetsToOtherLine", "draw"]);
+  assert.equal(massMoveOrSwap.fields.eventEffect.effects[0].target.min, 0);
+  assert.equal(massMoveOrSwap.fields.eventEffect.effects[0].target.max, MAX_LINE_SIZE * 2);
 
   const finral = encodeEgmanCardText({
     category: "Character",
@@ -1405,8 +1533,13 @@ test("EGM encoder handles static field keyword protection auras", () => {
   }).fields;
 
   assert.deepEqual(silverfang.staticFieldKeywordModifiers, [{
-    keyword: "opponentAbilityTargetTax",
-    value: true,
+    keyword: "targetingRestriction",
+    value: {
+      mode: "tax",
+      sourceTypes: [CARD_TYPES.CHARACTER, CARD_TYPES.EVENT],
+      payment: { kind: "handToSideline", amount: 1 },
+      during: "opponentTurn"
+    },
     target: {
       controller: "self",
       line: "field",
@@ -1427,8 +1560,13 @@ test("EGM encoder handles static field keyword protection auras", () => {
     trigger: ""
   }).fields;
   assert.deepEqual(kirito.staticKeywordModifiers, [{
-    keyword: "opponentAbilityTargetTax",
-    value: true,
+    keyword: "targetingRestriction",
+    value: {
+      mode: "tax",
+      sourceTypes: [CARD_TYPES.EVENT],
+      payment: { kind: "handToSideline", amount: 1 },
+      during: "opponentTurn"
+    },
     condition: { turn: "opponent" }
   }]);
 });
@@ -3065,6 +3203,20 @@ test("EGM encoder handles named and filtered hand-zone moves", () => {
     "draw",
     "moveHandToZone"
   ]);
+
+  const optionalAffinityDiscardThenDraw = encodeEgmanCardText({
+    category: "Character",
+    name: "Sung Jinwoo",
+    effect: "[When Played] You may place one [Shadow Army] affinity card from your hand into your sideline. If you do, draw a card.",
+    trigger: ""
+  });
+  assert.equal(optionalAffinityDiscardThenDraw.coverage.unsupported.length, 0);
+  const affinityEffects = optionalAffinityDiscardThenDraw.fields.abilities[0].effect.effect.effects;
+  assert.deepEqual(affinityEffects.map((effect) => effect.kind), [
+    "moveHandToZone",
+    "draw"
+  ]);
+  assert.deepEqual(affinityEffects[0].filter, { affinity: "shadow army" });
 });
 
 test("EGM encoder handles richer play-from-zone templates", () => {
@@ -3280,6 +3432,410 @@ test("EGM encoder handles quoted granted abilities and base-card timing inherita
   assert.equal(sidelinedWatcher.coverage.unsupported.length, 0);
   assert.equal(sidelinedWatcher.fields.abilities[0].effect.kind, "watchTargetSidelinedForEffect");
   assert.equal(sidelinedWatcher.fields.abilities[0].effect.effect.amount, 2);
+});
+
+test("EGM encoder keeps movement-granted timing abilities conditional", () => {
+  const encoded = encodeEgmanCardText({
+    category: "Character",
+    name: "Asuna",
+    effect: "[During Your Turn] [Once Per Turn] When this character moves outside of your movement phase, it gains \"[When Attacking] Draw a card\" until the end of the turn.",
+    trigger: "[Draw] Draw a card."
+  });
+  assert.equal(encoded.coverage.unsupported.length, 0);
+  assert.equal(encoded.fields.abilities.length, 1);
+  const movement = encoded.fields.abilities[0];
+  assert.equal(movement.timing, TIMINGS.WHEN_OWN_CHARACTER_MOVES_OUTSIDE_MOVEMENT_PHASE);
+  assert.equal(movement.oncePerTurn, true);
+  assert.equal(movement.conditions.turn, "controller");
+  assert.equal(movement.effect.kind, "grantAbility");
+  assert.equal(movement.effect.ability.timing, TIMINGS.WHEN_ATTACKING);
+  assert.equal(movement.effect.ability.effect.kind, "draw");
+});
+
+test("EGM encoder handles remaining audited exact card templates", () => {
+  const mina = encodeEgmanCardText({
+    category: "Character",
+    name: "Mina Ashiro",
+    effect: "[Activate: Main] [If on the Front Line] [Once Per Turn] Choose one resting character on your opponent's front line. It gains \"This character remains set to resting the next time it would be switched to active.\"",
+    trigger: ""
+  });
+  assert.equal(mina.coverage.unsupported.length, 0);
+  const restLock = mina.fields.abilities[0].effect;
+  assert.equal(restLock.kind, "restTargets");
+  assert.equal(restLock.preventNextReady, true);
+  assert.equal(restLock.target.rested, true);
+
+  const rakuzaichi = encodeEgmanCardText({
+    category: "Site",
+    name: "Rakuzaichi",
+    effect: "[Activate: Main] [Switch to Resting] Choose one of the following: ・Place the top card of your deck face down under this site. ・Place one card from your hand into your sideline. If you do, reveal all face-down cards under this site and {add them to your hand}. Your opponent may place two cards from their hand into their sideline. If they do, {place them into your sideline} instead.",
+    trigger: ""
+  });
+  assert.equal(rakuzaichi.coverage.unsupported.length, 0);
+  const opponentMove = flattenEffectTree(rakuzaichi.fields.abilities[0].effect)
+    .find((effect) => effect.kind === "opponentMayMoveCardsBetweenZonesElse");
+  assert.equal(opponentMove.count, 2);
+  assert.equal(opponentMove.source, "hand");
+  assert.equal(opponentMove.destination, "sideline");
+  assert.equal(opponentMove.destinationPlayer, "self");
+
+  const dailyQuest = encodeEgmanCardText({
+    category: "Site",
+    name: "Daily Quest",
+    effect: "[Activate: Main] [Switch to Resting] [Place 1 Card From Hand Into Sideline] You may place one face-down card under a card on your field into your sideline. If you do, add up to one <Sung Jinwoo> card with 0 required energy from your sideline to your hand.",
+    trigger: ""
+  });
+  assert.equal(dailyQuest.coverage.unsupported.length, 0);
+  const retrieve = flattenEffectTree(dailyQuest.fields.abilities[0].effect)
+    .find((effect) => effect.kind === "moveCardBetweenZones");
+  assert.equal(retrieve.filter.name, "sung jinwoo");
+  assert.equal(retrieve.filter.requiredEnergyMin, 0);
+  assert.equal(retrieve.filter.requiredEnergyMax, 0);
+
+  const diablo = encodeEgmanCardText({
+    category: "Character",
+    name: "Diablo",
+    effect: "[Activate: Main] [Once Per Turn] Choose one of the following: ・If this character has 6000 or more BP, switch it to active. ・This character gains \"[When Attacking] If this character has 6000 or more BP, draw up to one card\" until the end of the turn.",
+    trigger: ""
+  });
+  assert.equal(diablo.coverage.unsupported.length, 0);
+  const grant = flattenEffectTree(diablo.fields.abilities[0].effect)
+    .find((effect) => effect.kind === "grantAbility");
+  assert.equal(grant.ability.timing, TIMINGS.WHEN_ATTACKING);
+  assert.equal(grant.ability.effect.kind, "conditional");
+  assert.equal(grant.ability.effect.condition.selfBpMin, 6000);
+  assert.equal(grant.ability.effect.effect.kind, "optional");
+  assert.equal(grant.ability.effect.effect.effect.kind, "draw");
+});
+
+test("audited Boogie Woogie and Soka encodings preserve optional responder choices and effect order", () => {
+  const boogie = encodeEgmanCardText({
+    card_code: "UE03BT_JJK-1-098",
+    name: "Boogie Woogie",
+    category: "Event",
+    effect: "Choose one character with 5000 or less BP on your opponent's front line and place it on the bottom of their deck. Your opponent plays up to one character card with 3 or less required energy from their hand set to resting onto their front line. [When Played] abilities on characters played with this ability do not activate. If <Aoi Todo> is on your field, draw a card.",
+    trigger: ""
+  }).fields.eventEffect;
+  assert.deepEqual(boogie.effects.map((effect) => effect.kind), [
+    "suppressPlayedAbilities",
+    "moveTargetsToBottomDeck",
+    "playCardFromZone",
+    "conditional"
+  ]);
+  assert.equal(boogie.effects[1].target.bpMax, 5000);
+  assert.equal(boogie.effects[2].player, "opponent");
+  assert.equal(boogie.effects[2].min, 0);
+  assert.equal(boogie.effects[2].max, 1);
+  assert.equal(boogie.effects[3].condition.filter.name, "Aoi Todo");
+
+  const sokaFields = encodeEgmanCardText({
+    card_code: "UE20BT_TSK-2-029",
+    name: "Soka",
+    category: "Character",
+    effect: "[Activate: Main] [Switch to Resting] [Sideline This Card] Play one purple character card with 3 or less required energy and 1 AP cost from your hand set to active onto your field, or perform Raid with it. If you do, your opponent plays up to one character card with 2 or less required energy and 1 AP cost from their hand set to active onto their front line. [When Played] abilities on characters you and your opponent play with this ability do not activate.",
+    trigger: ""
+  }).fields;
+  assert.equal(sokaFields.abilities.length, 1);
+  const sokaAbility = sokaFields.abilities[0];
+  assert.equal(sokaAbility.timing, TIMINGS.ACTIVATE_MAIN);
+  assert.deepEqual(sokaAbility.cost, { restSelf: true, sidelineSelf: true });
+  assert.deepEqual(sokaAbility.effect.effects.map((effect) => effect.kind), [
+    "suppressPlayedAbilities",
+    "playOrRaidCardFromZone",
+    "playCardFromZone"
+  ]);
+  assert.equal(sokaAbility.effect.effects[1].requiredPlayedCountForFollowing, 1);
+  assert.deepEqual(sokaAbility.effect.effects[1].destinationLines, [LINES.FRONT, LINES.ENERGY]);
+  assert.equal(sokaAbility.effect.effects[2].player, "opponent");
+  assert.equal(sokaAbility.effect.effects[2].min, 0);
+});
+
+test("audited Rimuru and Cha Hae-in encodings preserve every legal play branch", () => {
+  const rimuru = encodeEgmanCardText({
+    card_code: "UE20BT_TSK-1-053",
+    name: "Rimuru",
+    category: "Character",
+    effect: "[When Played] Add up to one blue character card with 4 or less required energy and 1 AP cost from your sideline to your hand. If there are 4 or more character cards with 4000 or more BP or 4 or more event cards in your sideline, you may play that card set to active onto your field or perform Raid with it instead.",
+    trigger: ""
+  }).fields.abilities[0].effect;
+  assert.equal(rimuru.kind, "conditional");
+  assert.equal(rimuru.effect.kind, "chooseOne");
+  assert.deepEqual(rimuru.effect.choices.map((choice) => choice.id), ["add-to-hand", "play-or-raid"]);
+  const rimuruPlay = rimuru.effect.choices[1].effect;
+  assert.equal(rimuruPlay.min, 0);
+  assert.equal(rimuruPlay.max, 1);
+  assert.deepEqual(rimuruPlay.destinationLines, [LINES.FRONT, LINES.ENERGY]);
+  assert.equal(rimuruPlay.allowRaid, true);
+  assert.equal(rimuru.elseEffect.min, 0);
+
+  const cha = encodeEgmanCardText({
+    card_code: "UE17BT_SLG-1-011",
+    name: "Cha Hae-in",
+    category: "Character",
+    effect: "When this card is added from your sideline to your hand by one of your abilities, you may play it with fulfilled required energy from your hand set to resting onto your field. If this card was added to your hand by an ability on a <Sung Jinwoo>, set it to active instead. If you have 10 or more cards in your sideline, this character cannot be blocked by a character with 4000 or more BP. [When Played] Place the top card of your deck into your sideline.",
+    trigger: ""
+  }).fields;
+  const recoveryAbility = cha.abilities.find((ability) => ability.timing === TIMINGS.WHEN_SIDELINE_TO_HAND_BY_ABILITY);
+  assert.equal(recoveryAbility.effect.kind, "optional");
+  assert.equal(recoveryAbility.effect.effect.kind, "playSourceFromZone");
+  assert.equal(recoveryAbility.effect.effect.requiredEnergyFulfilled, true);
+  assert.equal(recoveryAbility.effect.effect.activeIfTriggerSourceName, "Sung Jinwoo");
+  assert.deepEqual(recoveryAbility.effect.effect.destinationLines, [LINES.FRONT, LINES.ENERGY]);
+});
+
+test("Cha Hae-in recovery is a runtime choice and only Sung Jinwoo makes it active", () => {
+  const chaFields = encodeEgmanCardText({
+    card_code: "UE17BT_SLG-1-011",
+    name: "Cha Hae-in",
+    category: "Character",
+    effect: "When this card is added from your sideline to your hand by one of your abilities, you may play it with fulfilled required energy from your hand set to resting onto your field. If this card was added to your hand by an ability on a <Sung Jinwoo>, set it to active instead. If you have 10 or more cards in your sideline, this character cannot be blocked by a character with 4000 or more BP. [When Played] Place the top card of your deck into your sideline.",
+    trigger: ""
+  }).fields;
+  const recoveryAbility = {
+    id: "recover-cha",
+    timing: TIMINGS.ACTIVATE_MAIN,
+    oncePerTurn: false,
+    conditions: {},
+    effect: {
+      kind: "moveCardBetweenZones",
+      source: "sideline",
+      destination: "hand",
+      count: 1,
+      filter: { name: "Cha Hae-in" }
+    }
+  };
+  const catalog = {
+    ...sampleCatalog,
+    private_cha: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_cha",
+      number: "UE17BT_SLG-1-011",
+      name: "Cha Hae-in",
+      color: "purple",
+      requiredEnergy: { color: "purple", amount: 4 },
+      ...chaFields
+    },
+    private_sung: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_sung",
+      number: "DEM-SUNG",
+      name: "Sung Jinwoo",
+      color: "purple",
+      abilities: [recoveryAbility]
+    },
+    private_other_recovery: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_other_recovery",
+      number: "DEM-OTHER-RECOVERY",
+      name: "Other Recovery",
+      color: "purple",
+      abilities: [recoveryAbility]
+    },
+    private_purple_energy: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_purple_energy",
+      number: "DEM-PURPLE-ENERGY",
+      name: "Purple Energy",
+      color: "purple",
+      energy: [{ color: "purple", amount: 4 }]
+    }
+  };
+  const makeGame = (sourceDefId) => {
+    const game = createGame({
+      catalog,
+      decks: { P1: sampleDeckList, P2: sampleDeckList },
+      skipShuffle: true,
+      validateDecks: false
+    });
+    game.phase = PHASES.MAIN;
+    game.activePlayer = "P1";
+    game.players.P1.frontLine = [testPermanent("recovery-source", "P1", sourceDefId)];
+    game.players.P1.energyLine = [testPermanent("energy-source", "P1", "private_purple_energy")];
+    game.players.P1.sideline = [{ uid: "cha-card", owner: "P1", defId: "private_cha", faceUp: true }];
+    game.players.P1.hand = [];
+    return game;
+  };
+  const recover = (game, accept = true) => applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "recover-cha",
+    resolutionChoiceResolver: ({ request }) => {
+      if (request.kind === "optionalEffect") return { [request.choiceKey]: accept };
+      if (request.kind === "playSourceFromZone") {
+        return { [request.destinationLineChoiceKey]: LINES.ENERGY };
+      }
+      return {};
+    }
+  });
+
+  const sungResult = recover(makeGame("private_sung"));
+  assert.equal(sungResult.players.P1.hand.length, 0);
+  assert.equal(topDefId(sungResult.players.P1.energyLine.at(-1)), "private_cha");
+  assert.equal(sungResult.players.P1.energyLine.at(-1).rested, false);
+
+  const otherResult = recover(makeGame("private_other_recovery"));
+  assert.equal(otherResult.players.P1.energyLine.at(-1).rested, true);
+
+  const declined = recover(makeGame("private_sung"), false);
+  assert.equal(declined.players.P1.hand[0].defId, "private_cha");
+  assert.equal(declined.players.P1.energyLine.length, 1);
+});
+
+test("Soka only offers the opponent a play after its own play succeeds and suppresses both When Played abilities", () => {
+  const drawAbility = (id) => ({
+    id,
+    timing: TIMINGS.WHEN_PLAYED,
+    oncePerTurn: false,
+    conditions: {},
+    effect: { kind: "draw", amount: 1 }
+  });
+  const sokaFields = encodeEgmanCardText({
+    card_code: "UE20BT_TSK-2-029",
+    name: "Soka",
+    category: "Character",
+    effect: "[Activate: Main] [Switch to Resting] [Sideline This Card] Play one purple character card with 3 or less required energy and 1 AP cost from your hand set to active onto your field, or perform Raid with it. If you do, your opponent plays up to one character card with 2 or less required energy and 1 AP cost from their hand set to active onto their front line. [When Played] abilities on characters you and your opponent play with this ability do not activate.",
+    trigger: ""
+  }).fields;
+  const catalog = {
+    ...sampleCatalog,
+    private_soka: {
+      id: "private_soka",
+      number: "UE20BT_TSK-2-029",
+      sourceCode: "UE20BT",
+      name: "Soka",
+      type: CARD_TYPES.CHARACTER,
+      color: "purple",
+      requiredEnergy: { color: "purple", amount: 2 },
+      apCost: 1,
+      bp: 2000,
+      energy: [{ color: "purple", amount: 1 }],
+      affinities: [],
+      ...sokaFields
+    },
+    private_soka_own_play: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_soka_own_play",
+      number: "DEM-SOKA-OWN",
+      name: "Soka Own Play",
+      color: "purple",
+      requiredEnergy: { color: "purple", amount: 1 },
+      apCost: 1,
+      abilities: [drawAbility("own-when-played")]
+    },
+    private_soka_opponent_play: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_soka_opponent_play",
+      number: "DEM-SOKA-OPPONENT",
+      name: "Soka Opponent Play",
+      requiredEnergy: { color: "green", amount: 1 },
+      apCost: 1,
+      abilities: [drawAbility("opponent-when-played")]
+    }
+  };
+  const makeGame = () => {
+    const game = createGame({
+      catalog,
+      decks: { P1: sampleDeckList, P2: sampleDeckList },
+      skipShuffle: true,
+      validateDecks: false
+    });
+    game.phase = PHASES.MAIN;
+    game.activePlayer = "P1";
+    game.players.P1.frontLine = [testPermanent("soka-source", "P1", "private_soka")];
+    game.players.P1.hand = [];
+    game.players.P2.hand = [{ uid: "soka-opponent-card", owner: "P2", defId: "private_soka_opponent_play", faceUp: true }];
+    game.players.P1.deck = [{ uid: "soka-own-draw", owner: "P1", defId: "demo_rookie", faceUp: false }];
+    game.players.P2.deck = [{ uid: "soka-opponent-draw", owner: "P2", defId: "demo_rookie", faceUp: false }];
+    return game;
+  };
+
+  const failed = applyAction(makeGame(), {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "activateMain-1",
+    choices: { opponentPlayHandIndex: { uid: "soka-opponent-card" } }
+  });
+  assert.equal(failed.players.P2.frontLine.length, 0);
+  assert.equal(failed.players.P2.hand[0].uid, "soka-opponent-card");
+
+  const successfulGame = makeGame();
+  successfulGame.players.P1.hand.push({ uid: "soka-own-card", owner: "P1", defId: "private_soka_own_play", faceUp: true });
+  const successful = applyAction(successfulGame, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "activateMain-1",
+    choices: {
+      playZoneIndex: { uid: "soka-own-card" },
+      performRaid: false,
+      opponentPlayHandIndex: { uid: "soka-opponent-card" }
+    }
+  });
+  assert.equal(successful.players.P1.frontLine[0].cards.at(-1).uid, "soka-own-card");
+  assert.equal(successful.players.P2.frontLine[0].cards.at(-1).uid, "soka-opponent-card");
+  assert.equal(successful.players.P1.deck[0].uid, "soka-own-draw");
+  assert.equal(successful.players.P2.deck[0].uid, "soka-opponent-draw");
+});
+
+test("EGM encoder preserves conditional and temporary quoted ability grants", () => {
+  const neon = encodeEgmanCardText({
+    category: "Character",
+    name: "Neon",
+    effect: "If you have used an event card this turn, this character gains [Damage (2)] and \" [When Attacking] You may draw a card. If you do, place one card from your hand into your sideline\" until the end of the turn.",
+    trigger: ""
+  });
+  assert.equal(neon.coverage.unsupported.length, 0);
+  assert.equal(neon.fields.abilities[0].timing, TIMINGS.WHEN_ATTACKING);
+  assert.deepEqual(neon.fields.abilities[0].conditions, { eventUsedThisTurn: "self" });
+  assert.equal(neon.fields.abilities[0].effect.kind, "optional");
+  assert.deepEqual(neon.fields.abilities[0].effect.effect.effects.map((effect) => effect.kind), ["draw", "moveHandToZone"]);
+
+  const cha = encodeEgmanCardText({
+    category: "Character",
+    name: "Cha Hae-in",
+    effect: "[When Played] If you have five or more [Fourth Jeju Island Raid] affinity cards on your field, switch this character to active and give it \" [When Attacking] This character remains set to resting the next time it would be switched to active\" until the end of the turn. You can only activate this <Cha Hae-in> ability one time each turn.",
+    trigger: ""
+  });
+  const chaEffects = cha.fields.abilities[0].effect.effect.effects;
+  assert.deepEqual(chaEffects.map((effect) => effect.kind), ["readySelf", "grantAbility"]);
+  assert.equal(chaEffects[1].ability.timing, TIMINGS.WHEN_ATTACKING);
+  assert.equal(chaEffects[1].ability.effect.preventNextReady, true);
+
+  const goto = encodeEgmanCardText({
+    category: "Character",
+    name: "Goto Ryuji",
+    effect: "Play this character set to active. [If on the Front Line] When a [Fourth Jeju Island Raid] affinity card on your field without [Japanese Hunters] affinity is sidelined, all [Japanese Hunters] affinity cards on your field gain \" [When Sidelined] Add this card to your hand\" until the end of the turn. [When Played] Choose up to one character on your field. It gains 1000 BP until the end of the turn.",
+    trigger: ""
+  });
+  assert.equal(goto.fields.staticModifiers, undefined);
+  const gotoGrant = goto.fields.abilities.find((ability) => ability.timing === TIMINGS.WHEN_OWN_CHARACTER_SIDELINED);
+  assert.equal(gotoGrant.conditions.line, LINES.FRONT);
+  assert.deepEqual(gotoGrant.conditions.sidelinedCharacter, {
+    affinity: "Fourth Jeju Island Raid",
+    withoutAffinity: "Japanese Hunters"
+  });
+  assert.equal(gotoGrant.effect.ability.timing, TIMINGS.WHEN_SIDELINED);
+  assert.equal(gotoGrant.effect.ability.effect.destination, "hand");
+
+  const ichigo = encodeEgmanCardText({
+    category: "Character",
+    name: "Ichigo Kurosaki",
+    effect: "[Activate: Main] [Once Per Turn] Place one card with \"Zangetsu\" or \"Getsuga\" in its card name from your hand into your sideline. If you do, draw a card and give this character 1000 BP and \" [When Attacking] Draw up to one card\" until the end of the turn.",
+    trigger: ""
+  });
+  const ichigoAbility = ichigo.fields.abilities[0];
+  assert.equal(ichigoAbility.cost.discardFromHand, 1);
+  assert.deepEqual(ichigoAbility.cost.discardFromHandFilter.anyOf, [
+    { nameIncludesAll: ["Zangetsu"] },
+    { nameIncludesAll: ["Getsuga"] }
+  ]);
+  assert.deepEqual(ichigoAbility.effect.effects.map((effect) => effect.kind), ["draw", "modifyBp", "grantAbility"]);
+  assert.equal(ichigoAbility.effect.effects[2].ability.effect.kind, "optional");
 });
 
 test("EGM encoder handles return-cost lists, target conditional returns, and raid-stack return replacements", () => {
@@ -3797,4 +4353,201 @@ test("field-to-deck, reveal-hand, and face-up-count templates resolve", () => {
     abilityId: "activateMain-1"
   });
   assert.equal(activeConditionGame.players.P1.frontLine[0].keywordModifiers.some((modifier) => modifier.keyword === "impact"), true);
+});
+
+test("EGM encoder preserves keyword grants without executing reminder text", () => {
+  const conditional = encodeEgmanCardText({
+    category: "Character",
+    name: "Conditional Finisher",
+    effect: "[When Played] If <Leader> is on your field, this character gains \"Your opponent must block this character's attacks if able\" and [Impact (1)] (When this character attacks and wins a battle, deal 1 damage to your opponent) until the end of the turn.",
+    trigger: ""
+  }).fields;
+  const conditionalEffects = flattenEffectTree(conditional.abilities[0].effect);
+  assert.deepEqual(conditionalEffects.filter((effect) => effect.kind === "grantKeyword").map((effect) => effect.keyword), [
+    "mustBlock",
+    "impact"
+  ]);
+  assert.equal(conditionalEffects.some((effect) => effect.kind === "damageOpponent"), false);
+
+  const choice = encodeEgmanCardText({
+    category: "Character",
+    name: "Choice Finisher",
+    effect: "[When Attacking] Choose one of the following: - This character gains 1000 BP until the end of the turn. - This character gains [Damage (2)] (When this character attacks and deals direct damage, deal 2 damage instead) until the end of the turn.",
+    trigger: ""
+  }).fields;
+  const choiceEffects = flattenEffectTree(choice.abilities[0].effect);
+  assert.ok(choiceEffects.some((effect) => effect.kind === "grantKeyword" && effect.keyword === "damage" && effect.value === 2));
+  assert.equal(choiceEffects.some((effect) => effect.kind === "damageOpponent"), false);
+
+  const nextTurnBuff = encodeEgmanCardText({
+    category: "Character",
+    name: "Persistent Defender",
+    effect: "[When Played] This character gains 2000 BP until the start of your next turn.",
+    trigger: ""
+  }).fields;
+  assert.equal(flattenEffectTree(nextTurnBuff.abilities[0].effect).find((effect) => effect.kind === "modifyBp").duration, "startOfNextTurn");
+});
+
+test("EGM encoder handles conditional blocker limits and multi-card play-or-Raid", () => {
+  const leafa = encodeEgmanCardText({
+    category: "Character",
+    name: "Leafa",
+    effect: "[Raid] <Leafa> Switch to active. May move to the front line. If you have five or more cards in your hand, this character cannot be blocked by a character with 4000 or more BP.",
+    trigger: ""
+  }).fields;
+  assert.deepEqual(leafa.staticKeywordModifiers, [{
+    keyword: "cantBeBlockedByBpMin",
+    value: 4000,
+    condition: { handSizeMin: 5 }
+  }]);
+
+  const event = encodeEgmanCardText({
+    category: "Event",
+    name: "Warrior Reinforcements",
+    effect: "Play up to two green character cards with 4 or more required energy and 1 AP cost from your hand set to active onto your front line or perform Raid with them on characters on your field.",
+    trigger: ""
+  }).fields.eventEffect;
+  assert.equal(event.kind, "playOrRaidCardFromZone");
+  assert.equal(event.count, 2);
+  assert.equal(event.allowRaid, true);
+});
+
+test("multi-card play-or-Raid resolves both selected Raid cards", () => {
+  const base = {
+    ...sampleCatalog.demo_rookie,
+    id: "private_raid_base",
+    number: "FAQ-RAID-BASE",
+    name: "Raid Base"
+  };
+  const raid = (id, number) => ({
+    ...sampleCatalog.demo_raider,
+    id,
+    number,
+    name: "Raid Upgrade",
+    raid: { names: ["Raid Base"], affinities: [] },
+    abilities: []
+  });
+  const catalog = {
+    ...sampleCatalog,
+    private_raid_base: base,
+    private_raid_one: raid("private_raid_one", "FAQ-RAID-1"),
+    private_raid_two: raid("private_raid_two", "FAQ-RAID-2"),
+    private_multi_raid_event: {
+      id: "private_multi_raid_event",
+      number: "FAQ-RAID-EVENT",
+      sourceCode: "FAQ",
+      name: "Multi Raid Event",
+      type: CARD_TYPES.EVENT,
+      color: "green",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      energy: [],
+      affinities: [],
+      eventEffect: {
+        kind: "playOrRaidCardFromZone",
+        zones: ["hand"],
+        count: 2,
+        simultaneous: true,
+        allowRaid: true,
+        rested: false,
+        destinationLine: LINES.FRONT,
+        choiceKey: "playZoneIndex",
+        filter: { type: CARD_TYPES.CHARACTER }
+      }
+    }
+  };
+  let game = createGame({ catalog, decks: { P1: sampleDeckList, P2: sampleDeckList }, skipShuffle: true, validateDecks: false });
+  game.phase = PHASES.MAIN;
+  game.activePlayer = "P1";
+  game.players.P1.frontLine = [
+    testPermanent("raid-base-one", "P1", "private_raid_base"),
+    testPermanent("raid-base-two", "P1", "private_raid_base")
+  ];
+  game.players.P1.hand = [
+    { uid: "multi-raid-event", owner: "P1", defId: "private_multi_raid_event", faceUp: true },
+    { uid: "multi-raid-one", owner: "P1", defId: "private_raid_one", faceUp: true },
+    { uid: "multi-raid-two", owner: "P1", defId: "private_raid_two", faceUp: true }
+  ];
+
+  game = applyAction(game, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    choices: {
+      playZoneIndex: [0, 1],
+      performRaid: [true, true],
+      raidTarget: [
+        { lineName: LINES.FRONT, index: 0 },
+        { lineName: LINES.FRONT, index: 1 }
+      ],
+      simultaneousPlayedOrder: [0, 1]
+    }
+  });
+
+  assert.equal(game.players.P1.frontLine[0].cards.at(-1).defId, "private_raid_one");
+  assert.equal(game.players.P1.frontLine[1].cards.at(-1).defId, "private_raid_two");
+  assert.equal(game.players.P1.frontLine[0].rested, false);
+  assert.equal(game.players.P1.frontLine[1].rested, false);
+});
+
+test("Impact plus starts at one when the character has no base Impact", () => {
+  const catalog = {
+    ...sampleCatalog,
+    private_impact_plus: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_impact_plus",
+      number: "FAQ-IMPACT-PLUS",
+      keywords: { impactPlus: 1 }
+    },
+    private_impact_and_plus: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_impact_and_plus",
+      number: "FAQ-IMPACT-BOTH",
+      keywords: { impact: 1, impactPlus: 1 }
+    }
+  };
+  const game = createGame({ catalog, decks: { P1: sampleDeckList, P2: sampleDeckList }, skipShuffle: true, validateDecks: false });
+  const defender = testPermanent("impact-defender", "P2", "demo_rookie");
+  assert.equal(internals.impactDamageAmount(game, testPermanent("impact-plus", "P1", "private_impact_plus"), defender), 1);
+  assert.equal(internals.impactDamageAmount(game, testPermanent("impact-both", "P1", "private_impact_and_plus"), defender), 2);
+});
+
+test("EGM encoder covers alternate names and newly audited static rule families", () => {
+  const aliases = encodeEgmanCardText({
+    name: "Kirito & Eugeo",
+    category: "Character",
+    effect: "This card is also treated as <Kirito> and <Eugeo>.",
+    trigger: ""
+  }).fields;
+  assert.deepEqual(aliases.alternateNames, ["Kirito", "Eugeo"]);
+
+  const kenshin = encodeEgmanCardText({
+    name: "Kenshin Himura",
+    category: "Character",
+    effect: "[During Your Turn] Your opponent's characters that lose to this character in battle move to their energy line instead of being sidelined.",
+    trigger: ""
+  }).fields;
+  assert.equal(kenshin.battleLosersToEnergyInstead, true);
+
+  const shikijo = encodeEgmanCardText({
+    name: "Shikijo",
+    category: "Character",
+    effect: "[During Your Turn] [If on the Front Line] If an <Aoshi Shinomori> leaves your field due to one of your opponent's abilities, you may sideline this active character instead.",
+    trigger: ""
+  }).fields;
+  assert.deepEqual(shikijo.opponentAbilityLeaveReplacement, {
+    protectedName: "Aoshi Shinomori",
+    requiresActive: true,
+    during: "controllerTurn",
+    line: LINES.FRONT
+  });
+
+  const zushi = encodeEgmanCardText({
+    name: "Zushi",
+    category: "Character",
+    effect: "[During Your Turn] [Once Per Turn] When this character's BP is increased, it gains 1000 BP until the end of the turn.",
+    trigger: ""
+  }).fields;
+  assert.equal(zushi.abilities[0].timing, TIMINGS.WHEN_BP_INCREASED);
+  assert.equal(zushi.abilities[0].oncePerTurn, true);
 });

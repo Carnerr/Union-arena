@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   CARD_TYPES,
+  copyLimitForCardNumber,
   displayCardCode,
   makeSavedDeck,
   parseDeckText,
@@ -126,6 +127,47 @@ test("deck validator applies card-specific copy limit overrides", () => {
 
   assert.equal(validation.size, 50);
   assert.equal(validation.sourceCode, "SLG");
+});
+
+test("copy limit helper exposes default and card-specific limits", () => {
+  assert.equal(copyLimitForCardNumber("UE02BT/HTR-1-026"), 3);
+  assert.equal(copyLimitForCardNumber("UE02BT/HTR-1-029"), 3);
+  assert.equal(copyLimitForCardNumber("UE17BT/SLG-1-030"), 12);
+  assert.equal(copyLimitForCardNumber("UE17BT_SLG-1-030"), 12);
+  assert.equal(copyLimitForCardNumber("UEX02BT/JJK-3-072"), 3);
+  assert.equal(copyLimitForCardNumber("UEX04BT/HTR-2-011"), 14);
+  assert.equal(copyLimitForCardNumber("UE15BT/EVA-1-033"), 4);
+});
+
+test("deck validator honors a catalog-defined copy limit", () => {
+  const catalog = {};
+  for (let index = 1; index <= 13; index += 1) {
+    const id = `limit_${index}`;
+    catalog[id] = {
+      id,
+      number: `UE99BT_LIM-1-${String(index).padStart(3, "0")}`,
+      sourceCode: "UE99BT",
+      name: `Limit ${index}`,
+      type: CARD_TYPES.CHARACTER,
+      color: "red",
+      requiredEnergy: { color: "red", amount: 0 },
+      apCost: 1,
+      bp: 1000,
+      energy: [{ color: "red", amount: 1 }],
+      affinities: [],
+      ...(index === 1 ? { deckCopyLimit: 3 } : {})
+    };
+  }
+  const legal = [
+    { id: "limit_1", count: 3 },
+    ...[...Array(11)].map((_, index) => ({ id: `limit_${index + 2}`, count: 4 })),
+    { id: "limit_13", count: 3 }
+  ];
+  assert.equal(validateDeck(legal, catalog).size, 50);
+  const illegal = legal.map((entry) => ({ ...entry }));
+  illegal[0].count = 4;
+  illegal.at(-1).count = 2;
+  assert.throws(() => validateDeck(illegal, catalog), /no more than 3/i);
 });
 
 test("deck text importer resolves equivalent ambiguous local reprints", () => {

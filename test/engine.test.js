@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   CARD_TYPES,
   LINES,
+  MAX_LINE_SIZE,
   PHASES,
   TIMINGS,
   applyAction,
@@ -59,6 +60,73 @@ test("sample deck satisfies Union Arena construction constraints", () => {
   const result = validateDeck(sampleDeckList, sampleCatalog);
   assert.equal(result.size, 50);
   assert.equal(result.sourceCode, "DEM");
+});
+
+test("actions isolate mutable game state without cloning the immutable catalog", () => {
+  const game = makeGame({ setupMode: "manual" });
+  const originalCard = game.players.P1.hand[0];
+  const next = applyAction(game, { type: "keepHand", player: "P1" });
+
+  assert.notStrictEqual(next, game);
+  assert.strictEqual(next.catalog, game.catalog);
+  assert.notStrictEqual(next.players, game.players);
+  assert.notStrictEqual(next.players.P1, game.players.P1);
+  assert.notStrictEqual(next.players.P1.hand, game.players.P1.hand);
+  assert.notStrictEqual(next.players.P1.hand[0], originalCard);
+  assert.equal(game.players.P1.setupKept, false);
+  assert.equal(next.players.P1.setupKept, true);
+
+  next.players.P1.hand[0].faceUp = false;
+  assert.equal(originalCard.faceUp, true);
+});
+
+test("filtered ability hand costs require and discard a matching card", () => {
+  const catalog = {
+    ...sampleCatalog,
+    filtered_cost_source: {
+      ...sampleCatalog.demo_rookie,
+      id: "filtered_cost_source",
+      number: "DEM-1-198",
+      name: "Filtered Cost Source",
+      abilities: [{
+        id: "activateMain-1",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        oncePerTurn: true,
+        cost: {
+          discardFromHand: 1,
+          discardFromHandFilter: { anyOf: [{ nameIncludesAll: ["Zangetsu"] }, { nameIncludesAll: ["Getsuga"] }] },
+          discardChoiceKey: "abilityDiscardHandIndexes"
+        },
+        effect: { kind: "draw", amount: 1 }
+      }]
+    },
+    matching_cost: {
+      ...sampleCatalog.demo_rookie,
+      id: "matching_cost",
+      number: "DEM-1-199",
+      name: "Getsuga Tensho"
+    }
+  };
+  let game = createGame({ catalog, decks: { P1: sampleDeckList, P2: sampleDeckList }, skipShuffle: true, validateDecks: false });
+  game = mainPhase(game);
+  game.players.P1.frontLine = [permanent("filtered-source", "P1", "filtered_cost_source")];
+  game.players.P1.hand = [card("nonmatch", "P1", "demo_guardian")];
+
+  assert.equal(legalActions(game, "P1").some((action) => action.type === "activateMainAbility"), false);
+
+  game.players.P1.hand.push(card("matching", "P1", "matching_cost"));
+  assert.equal(legalActions(game, "P1").some((action) => action.type === "activateMainAbility"), true);
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "activateMain-1",
+    choices: { abilityDiscardHandIndexes: [1] }
+  });
+
+  assert.equal(game.players.P1.sideline.some((item) => item.uid === "matching"), true);
+  assert.equal(game.players.P1.hand.some((item) => item.uid === "nonmatch"), true);
 });
 
 test("return-to-hand replacement keeps the character on field after paying a hand card", () => {
@@ -242,6 +310,48 @@ test("opponent optional sideline-to-removal payment chooses the correct branch",
   game = applyAction(game, { type: "declareAttack", player: "P1", attackerIndex: 0, choices: { opponentZoneMoveChoice: false } });
   assert.equal(game.players.P2.removal.length, 0);
   assert.equal(game.players.P2.frontLine.length, 0);
+});
+
+test("opponent hand cards can move into the controller's sideline", () => {
+  const catalog = {
+    ...sampleCatalog,
+    rakuzaichi_like: {
+      ...sampleCatalog.demo_site,
+      id: "rakuzaichi_like",
+      number: "DEM-1-207",
+      name: "Rakuzaichi Like",
+      abilities: [{
+        id: "activateMain-1",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: {
+          kind: "opponentMayMoveCardsBetweenZonesElse",
+          source: "hand",
+          destination: "sideline",
+          destinationPlayer: "self",
+          count: 2
+        }
+      }]
+    }
+  };
+  let game = createGame({ catalog, decks: { P1: sampleDeckList, P2: sampleDeckList }, skipShuffle: true, validateDecks: false });
+  game = mainPhase(game);
+  game.players.P1.energyLine = [permanent("site", "P1", "rakuzaichi_like")];
+  game.players.P2.hand = [card("gift-1", "P2", "demo_rookie"), card("gift-2", "P2", "demo_guardian")];
+
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.ENERGY,
+    index: 0,
+    abilityId: "activateMain-1",
+    choices: {
+      opponentZoneMoveChoice: true,
+      opponentZoneMoveIndices: [0, 1]
+    }
+  });
+  assert.equal(game.players.P2.hand.length, 0);
+  assert.deepEqual(game.players.P1.sideline.map((entry) => entry.uid), ["gift-1", "gift-2"]);
+  assert.deepEqual(game.players.P1.sideline.map((entry) => entry.owner), ["P2", "P2"]);
 });
 
 test("activate-main face-down-under condition is enforced", () => {
@@ -1062,6 +1172,48 @@ test("legal actions expose normal energy-to-front movement", () => {
   assert.equal(game.players.P1.frontLine.length, 1);
 });
 
+test("movement is selected once and can move characters in both directions simultaneously", () => {
+  let game = makeGame();
+  game.phase = PHASES.MOVEMENT;
+  game.activePlayer = "P1";
+  game.players.P1.frontLine = [permanent("movement-step", "P1", "demo_stepper")];
+  game.players.P1.energyLine = [permanent("movement-forward", "P1", "demo_rookie")];
+
+  const simultaneous = legalActions(game, "P1").find((action) => (
+    action.type === "moveCharacters"
+    && action.moves.length === 2
+    && action.moves.some((move) => move.from === LINES.FRONT && move.to === LINES.ENERGY)
+    && action.moves.some((move) => move.from === LINES.ENERGY && move.to === LINES.FRONT)
+  ));
+  assert.ok(simultaneous);
+
+  game = applyAction(game, simultaneous);
+  assert.equal(topDefId(game.players.P1.frontLine[0]), "demo_rookie");
+  assert.equal(topDefId(game.players.P1.energyLine[0]), "demo_stepper");
+  assert.equal(legalActions(game, "P1").some((action) => action.type === "moveCharacters"), false);
+  assert.throws(() => applyAction(game, simultaneous), /only be moved once during a movement phase/i);
+});
+
+test("simultaneous movement exposes destination-line overflow removals", () => {
+  let game = makeGame();
+  game.phase = PHASES.MOVEMENT;
+  game.activePlayer = "P1";
+  game.players.P1.frontLine = Array.from({ length: MAX_LINE_SIZE }, (_, index) => (
+    permanent(`movement-full-${index}`, "P1", "demo_guardian")
+  ));
+  game.players.P1.energyLine = [permanent("movement-overflow-forward", "P1", "demo_rookie")];
+
+  const movementActions = legalActions(game, "P1").filter((action) => action.type === "moveCharacters");
+  assert.equal(movementActions.length, MAX_LINE_SIZE);
+  assert.ok(movementActions.every((action) => action.movementReplacements?.length === 1));
+
+  game = applyAction(game, movementActions[2]);
+  assert.equal(game.players.P1.frontLine.length, MAX_LINE_SIZE);
+  assert.equal(game.players.P1.energyLine.length, 0);
+  assert.equal(game.players.P1.removal.length, 1);
+  assert.equal(topDefId(game.players.P1.frontLine.at(-1)), "demo_rookie");
+});
+
 test("direct attack deals damage and resolves get trigger into hand", () => {
   const catalog = sampleCatalog;
   const deck = [
@@ -1433,6 +1585,110 @@ test("field attack timing abilities can react to a matching attacker", () => {
 
   assert.equal(game.players.P1.hand.length, p1HandBefore + 1);
   assert.deepEqual(game.players.P1.energyLine[0].usedOncePerTurn, ["mahito-attack-draw"]);
+});
+
+test("attack ends cleanly when the attacker leaves during attack triggers", () => {
+  const catalog = {
+    ...sampleCatalog,
+    private_departing_attacker: {
+      ...sampleCatalog.demo_rookie,
+      id: "private_departing_attacker",
+      number: "DEM-1-107",
+      name: "Private Departing Attacker",
+      abilities: [
+        {
+          id: "attack-sideline-self",
+          timing: TIMINGS.WHEN_ATTACKING,
+          effect: { kind: "moveSelfCardToZone", destination: "sideline" }
+        }
+      ]
+    }
+  };
+
+  let game = createGame({
+    catalog,
+    decks: { P1: sampleDeckList, P2: sampleDeckList },
+    skipShuffle: true,
+    validateDecks: false
+  });
+  game.phase = PHASES.ATTACK;
+  game.activePlayer = "P1";
+  game.players.P1.frontLine = [permanent("departing-attacker", "P1", "private_departing_attacker")];
+
+  game = applyAction(game, { type: "declareAttack", player: "P1", attackerIndex: 0, target: { type: "player" } });
+
+  assert.equal(game.pendingAttack, null);
+  assert.equal(game.players.P1.frontLine.length, 0);
+  assert.equal(game.players.P1.sideline.at(-1).defId, "private_departing_attacker");
+  assert.deepEqual(legalActions(game, "P2"), []);
+});
+
+test("blocked attack ends cleanly when a battling character leaves before battle", () => {
+  const catalog = {
+    ...sampleCatalog,
+    private_departing_blocker: {
+      ...sampleCatalog.demo_guardian,
+      id: "private_departing_blocker",
+      number: "DEM-1-108",
+      name: "Private Departing Blocker",
+      abilities: [
+        {
+          id: "block-sideline-self",
+          timing: TIMINGS.WHEN_BLOCKING,
+          effect: { kind: "moveSelfCardToZone", destination: "sideline" }
+        }
+      ]
+    }
+  };
+
+  let game = createGame({
+    catalog,
+    decks: { P1: sampleDeckList, P2: sampleDeckList },
+    skipShuffle: true,
+    validateDecks: false
+  });
+  game.phase = PHASES.ATTACK;
+  game.activePlayer = "P1";
+  game.players.P1.frontLine = [permanent("blocked-attacker", "P1", "demo_rookie")];
+  game.players.P2.frontLine = [permanent("departing-blocker", "P2", "private_departing_blocker")];
+  game.players.P2.life = Array.from({ length: 7 }, (_, index) => ({
+    uid: `departing-blocker-life-${index}`,
+    owner: "P2",
+    defId: "demo_extra",
+    faceUp: false
+  }));
+
+  game = applyAction(game, { type: "declareAttack", player: "P1", attackerIndex: 0, target: { type: "player" } });
+  game = applyAction(game, { type: "declareBlock", player: "P2", blockerIndex: 0 });
+
+  assert.equal(game.pendingAttack, null);
+  assert.equal(game.players.P1.frontLine.length, 1);
+  assert.equal(game.players.P2.frontLine.length, 0);
+  assert.equal(game.players.P2.life.length, 7);
+  assert.equal(game.players.P2.sideline.at(-1).defId, "private_departing_blocker");
+});
+
+test("stale pending attacks are cleaned up during defender responses", () => {
+  let game = createGame({
+    catalog: sampleCatalog,
+    decks: { P1: sampleDeckList, P2: sampleDeckList },
+    skipShuffle: true,
+    validateDecks: false
+  });
+  game.phase = PHASES.ATTACK;
+  game.activePlayer = "P1";
+  game.pendingAttack = {
+    attackerPlayer: "P1",
+    defenderPlayer: "P2",
+    attackerPermanentId: "missing-attacker"
+  };
+  game.players.P1.frontLine = [];
+  game.players.P2.frontLine = [permanent("stale-blocker", "P2", "demo_guardian")];
+
+  game = applyAction(game, { type: "declineBlock", player: "P2" });
+
+  assert.equal(game.pendingAttack, null);
+  assert.equal(game.players.P2.life.length, 7);
 });
 
 test("attack phase timing abilities fire at phase and attack boundaries", () => {
@@ -2814,6 +3070,64 @@ test("legal actions include Raid choices while keeping normal play choices", () 
   }));
 });
 
+test("full-line plays and Raid movement enumerate every legal replacement", () => {
+  const catalog = {
+    ...sampleCatalog,
+    full_line_play: {
+      ...sampleCatalog.demo_rookie,
+      id: "full_line_play",
+      number: "DEM-FULL-LINE-PLAY",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0
+    },
+    full_line_raid_base: {
+      ...sampleCatalog.demo_rookie,
+      id: "full_line_raid_base",
+      number: "DEM-FULL-LINE-BASE",
+      name: "Full Line Raid Base"
+    },
+    full_line_raider: {
+      ...sampleCatalog.demo_raider,
+      id: "full_line_raider",
+      number: "DEM-FULL-LINE-RAIDER",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      raid: { names: ["Full Line Raid Base"], affinities: [] }
+    }
+  };
+  const makeFullGame = (handDefId) => {
+    const game = mainPhase(makeGame({ catalog, validateDecks: false }));
+    game.players.P1.frontLine = Array.from({ length: 4 }, (_, index) => (
+      permanent(`full-front-${index}`, "P1", "demo_guardian")
+    ));
+    game.players.P1.energyLine = [permanent("full-raid-base", "P1", "full_line_raid_base")];
+    game.players.P1.hand = [card("full-line-hand-card", "P1", handDefId)];
+    return game;
+  };
+
+  const playGame = makeFullGame("full_line_play");
+  const fullLinePlays = legalActions(playGame, "P1")
+    .filter((action) => action.type === "playCard" && action.destination === LINES.FRONT);
+  assert.deepEqual(fullLinePlays.map((action) => action.replaceIndex), [0, 1, 2, 3]);
+  const played = applyAction(playGame, fullLinePlays[2]);
+  assert.equal(played.players.P1.frontLine.length, 4);
+  assert.equal(played.players.P1.frontLine.at(-1).cards.at(-1).defId, "full_line_play");
+  assert.equal(played.players.P1.removal.length, 1);
+
+  const raidGame = makeFullGame("full_line_raider");
+  const raids = legalActions(raidGame, "P1").filter((action) => action.type === "performRaid");
+  assert.equal(raids.filter((action) => !action.moveToFront).length, 1);
+  assert.deepEqual(
+    raids.filter((action) => action.moveToFront).map((action) => action.replaceIndex),
+    [0, 1, 2, 3]
+  );
+  const movedRaid = applyAction(raidGame, raids.find((action) => action.moveToFront && action.replaceIndex === 1));
+  assert.equal(movedRaid.players.P1.energyLine.length, 0);
+  assert.equal(movedRaid.players.P1.frontLine.length, 4);
+  assert.equal(movedRaid.players.P1.frontLine.at(-1).cards.at(-1).defId, "full_line_raider");
+  assert.equal(movedRaid.players.P1.removal.length, 1);
+});
+
 test("unique-name reveal effects calculate BP threshold from hand and field", () => {
   const catalog = {
     ...sampleCatalog,
@@ -2987,6 +3301,111 @@ test("front-energy swap effects can swap opponent lines", () => {
   assert.equal(game.players.P2.energyLine[0].pid, "opponent-front");
 });
 
+test("field cards can raise the end-phase maximum hand size", () => {
+  const catalog = {
+    ...sampleCatalog,
+    large_hand_site: {
+      ...sampleCatalog.demo_site,
+      id: "large_hand_site",
+      number: "DEM-1-210",
+      name: "Large Hand Site",
+      maximumHandSize: 15
+    }
+  };
+  let game = makeGame({ catalog, validateDecks: false });
+  game.phase = PHASES.END;
+  game.players.P1.energyLine = [permanent("large-hand", "P1", "large_hand_site")];
+  game.players.P1.hand = [...Array(15)].map((_, index) => card(`hand-${index}`, "P1", "demo_rookie"));
+  assert.deepEqual(legalActions(game, "P1").map((action) => action.type), ["advancePhase"]);
+
+  game.players.P1.hand.push(card("hand-15", "P1", "demo_rookie"));
+  assert.deepEqual(legalActions(game, "P1").map((action) => action.type), ["discardForHandLimit"]);
+  game = applyAction(game, { type: "discardForHandLimit", player: "P1", handIndices: [15] });
+  assert.equal(game.players.P1.hand.length, 15);
+});
+
+test("front-line capacity reducers immediately remove overflow cards and recalculate capacity", () => {
+  const catalog = {
+    ...sampleCatalog,
+    capacity_reducer: {
+      ...sampleCatalog.demo_rookie,
+      id: "capacity_reducer",
+      number: "DEM-1-211",
+      name: "Capacity Reducer",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      lineCapacityModifiers: [{ line: LINES.FRONT, amount: -1, condition: { line: LINES.FRONT } }]
+    }
+  };
+  let game = mainPhase(makeGame({ catalog, validateDecks: false }));
+  game.players.P1.frontLine = [
+    permanent("old-1", "P1", "demo_rookie"),
+    permanent("old-2", "P1", "demo_rookie"),
+    permanent("old-3", "P1", "demo_rookie")
+  ];
+  game.players.P1.hand = [card("reducer-card", "P1", "capacity_reducer")];
+  game = applyAction(game, {
+    type: "playCard",
+    player: "P1",
+    handIndex: 0,
+    destination: LINES.FRONT
+  });
+
+  assert.equal(game.players.P1.frontLine.length, 3);
+  assert.equal(game.players.P1.frontLine.some((item) => topDefId(item) === "capacity_reducer"), true);
+  assert.equal(game.players.P1.removal.some((item) => item.uid === "old-1-card"), true);
+});
+
+test("play-only and own-ability-only line restrictions remain distinct", () => {
+  const catalog = {
+    ...sampleCatalog,
+    own_move_only: {
+      ...sampleCatalog.demo_rookie,
+      id: "own_move_only",
+      number: "DEM-1-212",
+      name: "Own Move Only",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      cannotPlayToFrontLine: true,
+      frontLineMoveByOwnAbilityOnly: true,
+      abilities: [{
+        id: "move-self",
+        timing: TIMINGS.ACTIVATE_MAIN,
+        effect: { kind: "moveTargetsToLine", destinationLine: LINES.FRONT, target: "self" }
+      }]
+    },
+    no_energy_entry: {
+      ...sampleCatalog.demo_rookie,
+      id: "no_energy_entry",
+      number: "DEM-1-213",
+      name: "No Energy Entry",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      cannotEnterEnergyLine: true
+    }
+  };
+  let game = mainPhase(makeGame({ catalog, validateDecks: false }));
+  game.players.P1.hand = [
+    card("own-move-card", "P1", "own_move_only"),
+    card("no-energy-card", "P1", "no_energy_entry")
+  ];
+  const playActions = legalActions(game, "P1").filter((action) => action.type === "playCard");
+  assert.equal(playActions.some((action) => action.handIndex === 0 && action.destination === LINES.FRONT), false);
+  assert.equal(playActions.some((action) => action.handIndex === 0 && action.destination === LINES.ENERGY), true);
+  assert.equal(playActions.some((action) => action.handIndex === 1 && action.destination === LINES.ENERGY), false);
+
+  game = applyAction(game, { type: "playCard", player: "P1", handIndex: 0, destination: LINES.ENERGY });
+  assert.equal(legalActions(game, "P1").some((action) => action.type === "moveCharacters"), false);
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.ENERGY,
+    index: 0,
+    abilityId: "move-self"
+  });
+  assert.equal(game.players.P1.frontLine.some((item) => topDefId(item) === "own_move_only"), true);
+});
+
 test("unbracketed leave-field abilities fire when a character leaves the field", () => {
   const catalog = {
     ...sampleCatalog,
@@ -3075,4 +3494,253 @@ test("unbracketed leave-field abilities fire when a character leaves the field",
   assert.equal(game.players.P1.frontLine.some((item) => item.cards.at(-1).defId === "rei_ayanami"), true);
   assert.equal(game.players.P1.frontLine.find((item) => item.cards.at(-1).defId === "rei_ayanami").rested, false);
   assert.equal(game.players.P1.sideline.some((card) => card.uid === "discard-for-leave"), true);
+});
+
+test("alternate card names satisfy Raid requirements", () => {
+  const catalog = {
+    ...sampleCatalog,
+    aliased_base: {
+      ...sampleCatalog.demo_rookie,
+      id: "aliased_base",
+      number: "DEM-ALIAS-BASE",
+      name: "Kirito & Eugeo",
+      alternateNames: ["Kirito", "Eugeo"]
+    },
+    alias_raid: {
+      ...sampleCatalog.demo_guardian,
+      id: "alias_raid",
+      number: "DEM-ALIAS-RAID",
+      name: "Eugeo Raid",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      raid: { names: ["Eugeo"], affinities: [] }
+    }
+  };
+  let game = mainPhase(makeGame({ catalog, validateDecks: false }));
+  game.players.P1.frontLine = [permanent("alias-base", "P1", "aliased_base")];
+  game.players.P1.hand = [card("alias-raid-card", "P1", "alias_raid")];
+
+  const raidAction = legalActions(game, "P1").find((action) => action.type === "performRaid");
+  assert.ok(raidAction);
+  game = applyAction(game, raidAction);
+  assert.equal(game.players.P1.frontLine[0].cards.at(-1).defId, "alias_raid");
+});
+
+test("battle replacement moves a defeated character to its controller's energy line", () => {
+  const catalog = {
+    ...sampleCatalog,
+    energy_battle_attacker: {
+      ...sampleCatalog.demo_guardian,
+      id: "energy_battle_attacker",
+      number: "DEM-BATTLE-ENERGY",
+      bp: 5000,
+      battleLosersToEnergyInstead: true
+    },
+    energy_battle_blocker: {
+      ...sampleCatalog.demo_rookie,
+      id: "energy_battle_blocker",
+      number: "DEM-BATTLE-BLOCKER",
+      bp: 1000
+    }
+  };
+  let game = makeGame({ catalog, validateDecks: false });
+  game.phase = PHASES.ATTACK;
+  game.activePlayer = "P1";
+  game.players.P1.frontLine = [permanent("energy-attacker", "P1", "energy_battle_attacker")];
+  game.players.P2.frontLine = [permanent("energy-blocker", "P2", "energy_battle_blocker")];
+  game.players.P2.energyLine = [];
+
+  game = applyAction(game, { type: "declareAttack", player: "P1", attackerIndex: 0, target: { type: "player" } });
+  game = applyAction(game, { type: "declareBlock", player: "P2", blockerIndex: 0 });
+
+  assert.equal(game.players.P2.frontLine.length, 0);
+  assert.equal(game.players.P2.energyLine[0].cards.at(-1).defId, "energy_battle_blocker");
+  assert.equal(game.players.P2.sideline.some((item) => item.defId === "energy_battle_blocker"), false);
+});
+
+test("battle-to-energy replacement exposes the defender's full-line removal choice", () => {
+  const catalog = {
+    ...sampleCatalog,
+    energy_battle_attacker: {
+      ...sampleCatalog.demo_guardian,
+      id: "energy_battle_attacker",
+      number: "DEM-BATTLE-ENERGY-FULL",
+      bp: 5000,
+      battleLosersToEnergyInstead: true
+    }
+  };
+  let game = makeGame({ catalog, validateDecks: false });
+  game.phase = PHASES.ATTACK;
+  game.activePlayer = "P1";
+  game.players.P1.frontLine = [permanent("energy-attacker-full", "P1", "energy_battle_attacker")];
+  game.players.P2.frontLine = [permanent("energy-blocker-full", "P2", "demo_rookie")];
+  game.players.P2.energyLine = [0, 1, 2, 3]
+    .map((index) => permanent(`energy-slot-${index}`, "P2", "demo_rookie"));
+
+  game = applyAction(game, { type: "declareAttack", player: "P1", attackerIndex: 0, target: { type: "player" } });
+  const blockActions = legalActions(game, "P2").filter((action) => action.type === "declareBlock");
+  assert.deepEqual(blockActions.map((action) => action.energyLineReplaceIndex), [0, 1, 2, 3]);
+
+  game = applyAction(game, blockActions[2]);
+  assert.equal(game.players.P2.removal.some((item) => item.uid === "energy-slot-2-card"), true);
+  assert.equal(game.players.P2.energyLine.some((item) => item.pid === "energy-blocker-full"), true);
+});
+
+test("front-line free-extra-draw text bypasses the AP payment", () => {
+  const catalog = {
+    ...sampleCatalog,
+    free_draw_source: {
+      ...sampleCatalog.demo_rookie,
+      id: "free_draw_source",
+      number: "DEM-FREE-DRAW",
+      freeExtraDrawFromFrontLine: true
+    }
+  };
+  let game = makeGame({ catalog, validateDecks: false });
+  game.players.P1.frontLine = [permanent("free-draw", "P1", "free_draw_source")];
+  game.players.P1.apCards.forEach((ap) => { ap.rested = true; });
+  const handBefore = game.players.P1.hand.length;
+
+  assert.equal(legalActions(game, "P1").some((action) => action.type === "extraDraw"), true);
+  game = applyAction(game, { type: "extraDraw", player: "P1" });
+  assert.equal(game.players.P1.hand.length, handBefore + 1);
+  assert.equal(game.players.P1.apCards.every((ap) => ap.rested), true);
+});
+
+test("BP-increase reactions resolve once without recursively retriggering", () => {
+  const catalog = {
+    ...sampleCatalog,
+    bp_reactor: {
+      ...sampleCatalog.demo_rookie,
+      id: "bp_reactor",
+      number: "DEM-BP-REACTOR",
+      bp: 2000,
+      abilities: [{
+        id: "react-once",
+        timing: TIMINGS.WHEN_BP_INCREASED,
+        oncePerTurn: true,
+        conditions: { turn: "controller" },
+        effect: { kind: "modifyBp", amount: 1000, duration: "turn", target: "self" }
+      }]
+    },
+    bp_boost_event: {
+      id: "bp_boost_event",
+      number: "DEM-BP-EVENT",
+      sourceCode: "DEM",
+      name: "BP Boost",
+      type: CARD_TYPES.EVENT,
+      color: "green",
+      requiredEnergy: { color: "green", amount: 0 },
+      apCost: 0,
+      affinities: [],
+      eventEffect: {
+        kind: "modifyBp",
+        amount: 500,
+        duration: "turn",
+        target: { controller: "self", line: LINES.FRONT, name: "Demo Rookie", max: 1 }
+      }
+    }
+  };
+  catalog.bp_reactor.name = "Demo Rookie";
+  let game = mainPhase(makeGame({ catalog, validateDecks: false }));
+  game.players.P1.frontLine = [permanent("bp-reactor", "P1", "bp_reactor")];
+  game.players.P1.hand = [card("bp-event", "P1", "bp_boost_event")];
+
+  game = applyAction(game, { type: "playCard", player: "P1", handIndex: 0 });
+  assert.equal(internals.battlePower(game, game.players.P1.frontLine[0]), 3500);
+  assert.deepEqual(game.players.P1.frontLine[0].usedOncePerTurn, ["react-once"]);
+});
+
+test("named opponent-ability leave replacement sidelines its active source instead", () => {
+  const catalog = {
+    ...sampleCatalog,
+    main_activator: {
+      ...sampleCatalog.demo_rookie,
+      id: "main_activator",
+      number: "DEM-MAIN-ACTIVATOR",
+      abilities: [{ id: "activate", timing: TIMINGS.ACTIVATE_MAIN, effect: { kind: "none" } }]
+    },
+    aoshi: {
+      ...sampleCatalog.demo_rookie,
+      id: "aoshi",
+      number: "DEM-AOSHI",
+      name: "Aoshi Shinomori"
+    },
+    shikijo: {
+      ...sampleCatalog.demo_rookie,
+      id: "shikijo",
+      number: "DEM-SHIKIJO",
+      name: "Shikijo",
+      opponentAbilityLeaveReplacement: {
+        protectedName: "Aoshi Shinomori",
+        requiresActive: true,
+        during: "controllerTurn",
+        line: LINES.FRONT
+      }
+    },
+    opponent_watcher: {
+      ...sampleCatalog.demo_rookie,
+      id: "opponent_watcher",
+      number: "DEM-WATCHER",
+      abilities: [{
+        id: "remove-aoshi",
+        timing: TIMINGS.WHEN_OPPONENT_ACTIVATE_MAIN_ABILITY,
+        effect: {
+          kind: "sidelineTargets",
+          target: { controller: "opponent", line: LINES.FRONT, name: "Aoshi Shinomori", max: 1 }
+        }
+      }]
+    }
+  };
+  let game = mainPhase(makeGame({ catalog, validateDecks: false }));
+  game.players.P1.frontLine = [
+    permanent("activator", "P1", "main_activator"),
+    permanent("shikijo", "P1", "shikijo"),
+    permanent("aoshi", "P1", "aoshi")
+  ];
+  game.players.P2.frontLine = [permanent("watcher", "P2", "opponent_watcher")];
+
+  game = applyAction(game, {
+    type: "activateMainAbility",
+    player: "P1",
+    line: LINES.FRONT,
+    index: 0,
+    abilityId: "activate"
+  });
+
+  assert.equal(game.players.P1.frontLine.some((item) => topDefId(item) === "aoshi"), true);
+  assert.equal(game.players.P1.frontLine.some((item) => topDefId(item) === "shikijo"), false);
+  assert.equal(game.players.P1.sideline.some((item) => item.defId === "shikijo"), true);
+});
+
+test("a card can replace its own Get trigger with a printed alternative", () => {
+  const activeEffect = {
+    kind: "sequence",
+    effects: [
+      { kind: "readyTargets", target: { controller: "self", line: "field", type: CARD_TYPES.CHARACTER, max: 1 } },
+      { kind: "modifyBp", amount: 3000, duration: "turn", target: { controller: "self", line: "field", type: CARD_TYPES.CHARACTER, max: 1 } }
+    ]
+  };
+  const catalog = {
+    ...sampleCatalog,
+    flexible_trigger: {
+      ...sampleCatalog.demo_rookie,
+      id: "flexible_trigger",
+      number: "DEM-FLEX-TRIGGER",
+      trigger: { type: "get" },
+      selfTriggerAlternatives: [{ type: "draw", amount: 1 }, { type: "active", effect: activeEffect }]
+    }
+  };
+  const game = makeGame({ catalog, validateDecks: false });
+  game.players.P2.life = [card("flex-life", "P2", "flexible_trigger", false)];
+  game.players.P2.deck = [card("drawn-card", "P2", "demo_guardian", false)];
+  game.players.P2.hand = [];
+
+  internals.dealDamage(game, "P2", 1, {
+    sourcePlayer: "P1",
+    triggerChoices: [{ choices: { selfTriggerType: "draw" } }]
+  });
+
+  assert.equal(game.players.P2.hand.some((item) => item.uid === "drawn-card"), true);
+  assert.equal(game.players.P2.sideline.some((item) => item.uid === "flex-life"), true);
 });

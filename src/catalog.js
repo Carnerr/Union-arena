@@ -70,6 +70,11 @@ function parseInteger(value, fallback = 0) {
   return match ? Number(match[0]) : fallback;
 }
 
+function parseOptionalInteger(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  return parseInteger(value);
+}
+
 export function normalizeColor(value) {
   const normalized = COLOR_MAP.get(lower(value));
   assertRule(normalized || !value, "CARD_COLOR", `Unknown card color: ${value}`);
@@ -242,6 +247,12 @@ export function normalizeEffect(effect) {
       ability: effect.ability ? normalizeAbility(effect.ability) : effect.ability
     };
   }
+  if (effect.kind === "predictTopDeckRequiredEnergy") {
+    return {
+      ...effect,
+      successEffect: normalizeEffect(effect.successEffect)
+    };
+  }
   return effect;
 }
 
@@ -274,6 +285,7 @@ export function normalizeCardDefinition(record) {
     number,
     sourceCode: compactString(firstDefined(record, ["sourceCode", "source_code"])) || sourceCodeFromNumber(number),
     name: compactString(firstDefined(record, ["name", "cardName", "card_name"])),
+    alternateNames: parseJsonArray(firstDefined(record, ["alternateNames", "alternate_names"])),
     type,
     title: compactString(firstDefined(record, ["title", "sourceTitle", "source_title"])),
     color,
@@ -297,16 +309,37 @@ export function normalizeCardDefinition(record) {
     choiceModeAssists,
     triggerReplacements,
     gainsBaseAbilityTimings: parseJsonArray(firstDefined(record, ["gainsBaseAbilityTimings", "gains_base_ability_timings"])),
+    deckCopyLimit: parseOptionalInteger(firstDefined(record, ["deckCopyLimit", "deck_copy_limit"])),
+    maximumHandSize: parseOptionalInteger(firstDefined(record, ["maximumHandSize", "maximum_hand_size"])),
+    lineCapacityModifiers: parseJsonArray(firstDefined(record, ["lineCapacityModifiers", "line_capacity_modifiers"])),
+    targetingRestrictions: parseJsonArray(firstDefined(record, ["targetingRestrictions", "targeting_restrictions"])),
+    abilityProtections: parseJsonArray(firstDefined(record, ["abilityProtections", "ability_protections"])),
+    raidTargetPermissions: parseJsonArray(firstDefined(record, ["raidTargetPermissions", "raid_target_permissions"])),
+    raidUseCondition: firstDefined(record, ["raidUseCondition", "raid_use_condition"]),
+    raidOnlyPlay: Boolean(firstDefined(record, ["raidOnlyPlay", "raid_only_play"])),
     returnRaidStackToHandOnReturn: Boolean(firstDefined(record, ["returnRaidStackToHandOnReturn", "return_raid_stack_to_hand_on_return"])),
     sidelineTopRaidCardInstead: Boolean(firstDefined(record, ["sidelineTopRaidCardInstead", "sideline_top_raid_card_instead"])),
     battleLosersToRemovalInstead: Boolean(firstDefined(record, ["battleLosersToRemovalInstead", "battle_losers_to_removal_instead"])),
+    battleLosersToEnergyInstead: Boolean(firstDefined(record, ["battleLosersToEnergyInstead", "battle_losers_to_energy_instead"])),
+    freeExtraDrawFromFrontLine: Boolean(firstDefined(record, ["freeExtraDrawFromFrontLine", "free_extra_draw_from_front_line"])),
+    selfTriggerAlternatives: parseJsonArray(firstDefined(record, ["selfTriggerAlternatives", "self_trigger_alternatives"]))
+      .map((alternative) => ({ ...alternative, effect: normalizeEffect(alternative.effect) })),
+    opponentAbilityLeaveReplacement: firstDefined(record, ["opponentAbilityLeaveReplacement", "opponent_ability_leave_replacement"]),
     returnToHandHandSidelineInstead: Boolean(firstDefined(record, ["returnToHandHandSidelineInstead", "return_to_hand_hand_sideline_instead"])),
     topRaidCardToSidelineInsteadOnOpponentLeave: Boolean(firstDefined(record, ["topRaidCardToSidelineInsteadOnOpponentLeave", "top_raid_card_to_sideline_instead_on_opponent_leave"])),
-    topRaidReplacementBaseRequiredEnergyMin: parseInteger(firstDefined(record, ["topRaidReplacementBaseRequiredEnergyMin", "top_raid_replacement_base_required_energy_min"]), undefined),
+    topRaidReplacementBaseRequiredEnergyMin: parseOptionalInteger(firstDefined(record, ["topRaidReplacementBaseRequiredEnergyMin", "top_raid_replacement_base_required_energy_min"])),
     sidelineInsteadForFrontGoreinu: Boolean(firstDefined(record, ["sidelineInsteadForFrontGoreinu", "sideline_instead_for_front_goreinu"])),
     moveToEnergyInsteadOnOpponentAbilityLeave: Boolean(firstDefined(record, ["moveToEnergyInsteadOnOpponentAbilityLeave", "move_to_energy_instead_on_opponent_ability_leave"])),
     moveToEnergyInsteadOnOpponentAbilityBpReduction: Boolean(firstDefined(record, ["moveToEnergyInsteadOnOpponentAbilityBpReduction", "move_to_energy_instead_on_opponent_ability_bp_reduction"])),
     cannotEnterFrontLine: Boolean(firstDefined(record, ["cannotEnterFrontLine", "cannot_enter_front_line"])),
+    cannotEnterEnergyLine: Boolean(firstDefined(record, ["cannotEnterEnergyLine", "cannot_enter_energy_line"])),
+    cannotPlayToFrontLine: Boolean(firstDefined(record, ["cannotPlayToFrontLine", "cannot_play_to_front_line"])),
+    cannotPlayToEnergyLine: Boolean(firstDefined(record, ["cannotPlayToEnergyLine", "cannot_play_to_energy_line"])),
+    cannotMoveDuringMovementPhase: Boolean(firstDefined(record, ["cannotMoveDuringMovementPhase", "cannot_move_during_movement_phase"])),
+    frontLineMoveByOwnAbilityOnly: Boolean(firstDefined(record, ["frontLineMoveByOwnAbilityOnly", "front_line_move_by_own_ability_only"])),
+    frontLineEntryCondition: firstDefined(record, ["frontLineEntryCondition", "front_line_entry_condition"]),
+    opponentAbilityRemovalProtection: Boolean(firstDefined(record, ["opponentAbilityRemovalProtection", "opponent_ability_removal_protection"])),
+    abilityReturnToHandProtection: Boolean(firstDefined(record, ["abilityReturnToHandProtection", "ability_return_to_hand_protection"])),
     entersActive: Boolean(firstDefined(record, ["entersActive", "enters_active"])),
     entersActiveCondition: firstDefined(record, ["entersActiveCondition", "enters_active_condition"]),
     rarity: compactString(firstDefined(record, ["rarity", "rare"])),

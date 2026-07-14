@@ -174,7 +174,7 @@ function classifyActions(text) {
   add("returnToHand", /return(?:s)? [^.]+ to (?:your|their|its owner's) hand|add this card to your hand|add this card from your sideline to your hand/);
   add("sidelineTarget", /(?:sideline|sidelines) (?:it|them|that character|the chosen character|one character|all characters|this character|this site)|place [^.]+ into (?:your|their) sideline/, {}, rulesText);
   add("removeTarget", /(?:place|placed|move|moved|add|added)[^.]+(?:into|to|in) (?:your|their|its|the)? ?removal area|removal area instead of (?:your|their|the)? ?sideline|into your removal area instead|used with this ability into your removal area/, {}, rulesText);
-  add("readyTarget", /switch(?:es)? [^.]+ to active|switch all [^.]+ to active/);
+  add("readyTarget", /switch(?:es)? [^.]+ to active|switch all [^.]+ to active/, {}, rulesText);
   if (/switch(?:es)? [^.]+ to resting|set to resting/.test(rulesText)) {
     categories.push({ kind: "restTarget", pattern: "switch(?:es)? [^.]+ to resting|set to resting" });
   }
@@ -184,7 +184,7 @@ function classifyActions(text) {
   add("topDeckMove", /top of (?:your|their|its owner's|your opponent's) deck/);
   add("lifeMove", /(?:add|place|move) [^.]+ from your life area|from your life into your sideline|place [^.]+ into (?:your|their) life area/, {}, rulesText);
   add("underCard", /under (?:this|it|the chosen|another)|under-card|raided card|base card/);
-  add("damage", /deal (?:one|two|three|\d+) damage/);
+  add("damage", /deal (?:one|two|three|\d+) damage/, {}, rulesText);
   add("bpModify", /(?:gains?|loses?|reduce [^.]+ bp|give it) \{?\d+ bp\}?/);
   add("energyGrant", /(?:gains?|gain) [^."]*(?:\[(?:red|blue|green|yellow|purple)\]\s*)+energy generation|(?:gains?|gain) "[^"]*energy generation|generates energy even/);
   add("keywordGrant", /\[(?:impact|damage|snipe|step|double attack|double block|nullify impact)[^\]]*\]|gains? \[(?:impact|damage|snipe|step|double attack|double block|nullify impact)/);
@@ -256,7 +256,9 @@ function describeEncoding(def) {
     staticFieldModifiers: (def?.staticFieldModifiers ?? []).length,
     staticEnergyModifiers: (def?.staticEnergyModifiers ?? []).length,
     staticKeywordModifiers: (def?.staticKeywordModifiers ?? []).length,
+    staticKeywordNames: (def?.staticKeywordModifiers ?? []).map((modifier) => modifier.keyword),
     staticFieldKeywordModifiers: (def?.staticFieldKeywordModifiers ?? []).length,
+    staticFieldKeywordNames: (def?.staticFieldKeywordModifiers ?? []).map((modifier) => modifier.keyword),
     useCostModifiers: (def?.useCostModifiers ?? []).length,
     staticUseCostModifiers: (def?.staticUseCostModifiers ?? []).length,
     gainsBaseAbilityTimings: (def?.gainsBaseAbilityTimings ?? []).length,
@@ -287,13 +289,13 @@ function categoryEncoded(category, encoded) {
     case "optionalEffect":
       return true;
     case "draw":
-      return hasAnyKind(encoded, ["draw", "drawUntilHandSize", "drawOpponent", "drawLastMovedFromHandCount", "drawLastRestedTargetControllers", "sidelineTargetsAndDraw", "grantKeyword", "grantAbility", "watchTargetSidelinedForEffect", "opponentMaySidelineChosenTargetsElse", "opponentMayMoveCardsBetweenZonesElse"]);
+      return hasAnyKind(encoded, ["draw", "drawUntilHandSize", "drawOpponent", "opponentMayDraw", "drawLastMovedFromHandCount", "drawLastRestedTargetControllers", "sidelineTargetsAndDraw", "grantKeyword", "grantAbility", "watchTargetSidelinedForEffect", "opponentMaySidelineChosenTargetsElse", "opponentMayMoveCardsBetweenZonesElse"]);
     case "searchTopDeck":
       return hasAnyKind(encoded, ["searchTopDeck"]);
     case "lookTopDeck":
       return hasAnyKind(encoded, ["lookTopDeck", "lookTopDeckAndMove", "lookTopDeckPlayOneAndMoveRest", "revealTopDeckOptionalPlayOrRaidInstead", "searchTopDeck"]);
     case "revealTopDeck":
-      return hasAnyKind(encoded, ["searchTopDeck", "moveTopDeck", "turnTopDeckFaceUp", "lookTopDeck", "lookTopDeckAndMove", "revealTopDeckOptionalPlayOrRaidInstead"]);
+      return hasAnyKind(encoded, ["searchTopDeck", "moveTopDeck", "turnTopDeckFaceUp", "lookTopDeck", "lookTopDeckAndMove", "revealTopDeckOptionalPlayOrRaidInstead", "predictTopDeckRequiredEnergy"]);
     case "playFromZone":
       return hasAnyKind(encoded, ["playCardFromZone", "playOrRaidCardFromZone", "playSourceFromZone", "playBaseCardFromSelf", "playSomeNamedFromSidelineAddRest", "revealTopDeckOptionalPlayOrRaidInstead", "useEventFromZone"]);
     case "useFromSideline":
@@ -362,7 +364,8 @@ function categoryEncoded(category, encoded) {
         || encoded.hasFaceDownUnderCondition;
     case "damage":
       return hasAnyKind(encoded, ["damageOpponent", "damage"])
-        || hasKeywordAny(encoded, ["impact", "impactPlus", "damage", "damagePlus"]);
+        || hasKeywordAny(encoded, ["impact", "impactPlus", "damage", "damagePlus"])
+        || ["impact", "impactPlus", "damage", "damagePlus"].some((keyword) => encoded.staticKeywordNames.includes(keyword) || encoded.staticFieldKeywordNames.includes(keyword));
     case "bpModify":
       return hasAnyKind(encoded, ["modifyBp", "modifyBpForHandReveal", "modifyNextBpRange", "applyTieredAbilityGrants"]) || encoded.staticModifiers > 0 || encoded.staticFieldModifiers > 0;
     case "energyGrant":
@@ -434,6 +437,7 @@ function walkEffectTree(effect, callback) {
   if (effect.insteadEffect) walkEffectTree(effect.insteadEffect, callback);
   if (effect.upgradedEffect) walkEffectTree(effect.upgradedEffect, callback);
   if (effect.ifMovedEffect) walkEffectTree(effect.ifMovedEffect, callback);
+  if (effect.successEffect) walkEffectTree(effect.successEffect, callback);
   for (const child of effect.effects ?? []) walkEffectTree(child, callback);
   for (const choice of effect.choices ?? []) walkEffectTree(choice.effect, callback);
 }

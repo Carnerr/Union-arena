@@ -1,13 +1,17 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   analyzeSetupHand,
   applyAction,
   catalogGameResult,
   createSimulationGame,
+  DEFAULT_POLICY_DIR,
   loadCatalogJson,
   loadDeckJson,
+  normalizePilotPolicy,
+  resolvePolicyForDeck,
+  resolvePilotSetup,
   runAutoplayGame,
   summarizeGameState
 } from "../src/index.js";
@@ -15,6 +19,7 @@ import {
 const DEFAULT_CATALOG = "work/private/egman-unionarena-catalog.json";
 const DEFAULT_LIBRARY = "work/private/decks";
 const DEFAULT_OUT_DIR = "work/private/batch-simulations";
+const CURRENT_POLICY_PATH = "work/private/pilot-agent/current-best-policy.json";
 
 const p1 = requiredOption("--p1");
 const p2 = requiredOption("--p2");
@@ -31,8 +36,14 @@ const playout = hasFlag("--playout") || hasFlag("--auto-play");
 const maxTurns = Number(option("--max-turns") ?? 100);
 const maxActions = Number(option("--max-actions") ?? 1000);
 const autoMulliganBricks = hasFlag("--auto-mulligan-bricks");
+const pilotMulligan = hasFlag("--pilot-mulligan") || hasFlag("--agent-mulligan");
 const alternateFirst = hasFlag("--alternate-first");
 const firstPlayer = option("--first-player") ?? "P1";
+const useCurrentPolicy = hasFlag("--use-current-policy") || hasFlag("--current-policy");
+const p1PolicyPath = resolvePolicyPath(option("--pilot-policy") ?? option("--p1-policy") ?? (useCurrentPolicy ? "current" : undefined));
+const p2PolicyPath = resolvePolicyPath(option("--opponent-policy") ?? option("--opponent-pilot-policy") ?? option("--p2-policy") ?? (useCurrentPolicy ? "current" : undefined));
+const policyDir = option("--policy-dir") ?? DEFAULT_POLICY_DIR;
+const fallbackPolicyPath = resolvePolicyPath(option("--fallback-policy") ?? "current");
 
 if (hasFlag("--help")) {
   usage();
@@ -43,6 +54,15 @@ const catalog = loadCatalogJson(catalogPath);
 const decks = {
   P1: loadDeckJson(deckPath(p1)),
   P2: loadDeckJson(deckPath(p2))
+};
+const savedDecks = {
+  P1: loadSavedDeck(deckPath(p1)),
+  P2: loadSavedDeck(deckPath(p2))
+};
+const policySelection = policySelectionForDecks();
+const policyConfig = {
+  P1: policySelection.P1.policy,
+  P2: policySelection.P2.policy
 };
 
 mkdirSync(outDir, { recursive: true });
@@ -59,13 +79,11 @@ for (let index = 0; index < games; index += 1) {
     skipShuffle,
     validateDecks,
     firstPlayer: firstPlayerForGame(index),
-    setupMode: autoMulliganBricks ? "manual" : "auto"
+    setupMode: autoMulliganBricks || pilotMulligan ? "manual" : "auto"
   });
-  const setupState = autoMulliganBricks
-    ? resolveBrickMulligans(simulation.state)
-    : simulation.state;
+  const setupState = resolveSetupState(simulation.state, policyConfig);
   const playoutResult = playout
-    ? runAutoplayGame(setupState, { maxTurns, maxActions })
+    ? runAutoplayGame(setupState, { maxTurns, maxActions, policy: policyConfig })
     : { state: setupState, steps: 0, stoppedReason: "notRun" };
   const finalState = playoutResult.state;
   const playoutMeta = {
@@ -81,7 +99,12 @@ for (let index = 0; index < games; index += 1) {
       statePath: statePath ?? null
     }),
     playoutSteps: playoutMeta.steps,
-    playoutStoppedReason: playoutMeta.stoppedReason
+    playoutStoppedReason: playoutMeta.stoppedReason,
+    playoutFailureCode: playoutResult.failureDiagnostics?.candidateFailures?.[0]?.code ?? "",
+    playoutFailureMessage: playoutResult.failureDiagnostics?.candidateFailures?.[0]?.message ?? "",
+    playoutFailureDiagnostics: playoutResult.failureDiagnostics
+      ? JSON.stringify(playoutResult.failureDiagnostics)
+      : ""
   };
   if (statePath) {
     writeFileSync(statePath, `${JSON.stringify({
@@ -134,8 +157,13 @@ writeFileSync(summaryPath, `${JSON.stringify({
   maxTurns,
   maxActions,
   autoMulliganBricks,
+  pilotMulligan,
   alternateFirst,
   firstPlayer,
+  policyPaths: {
+    P1: policySelection.P1.path ?? null,
+    P2: policySelection.P2.path ?? null
+  },
   rows
 }, null, 2)}\n`);
 writeFileSync(csvPath, csvFromRows(rows));
@@ -154,9 +182,14 @@ writeFileSync(gameCatalogPath, `${JSON.stringify({
   maxTurns,
   maxActions,
   autoMulliganBricks,
+  pilotMulligan,
   alternateFirst,
   firstPlayer,
-  brickDefinition: "A player is marked bricked when their final setup hand contains no character with requiredEnergy.amount equal to 0.",
+  policyPaths: {
+    P1: policySelection.P1.path ?? null,
+    P2: policySelection.P2.path ?? null
+  },
+  brickDefinition: "A player is marked bricked when their final setup hand contains no setup-valid opener: a literal 0-cost character or a character whose hand-only setup cost is reduced to 0 on an empty field.",
   rows: gameCatalogRows
 }, null, 2)}\n`);
 writeFileSync(gameCatalogCsvPath, csvFromRows(gameCatalogRows));
@@ -164,8 +197,10 @@ writeFileSync(gameCatalogCsvPath, csvFromRows(gameCatalogRows));
 console.log(`Created ${games} game(s): ${p1} vs ${p2}`);
 console.log(`Random seed mode: ${randomize ? "random" : seed === undefined ? "deterministic sequential from 1" : `deterministic sequential from ${seed}`}`);
 console.log(`Auto mulligan bricks: ${autoMulliganBricks ? "enabled" : "disabled"}`);
+console.log(`Pilot mulligan: ${pilotMulligan ? "enabled" : "disabled"}`);
 console.log(`First player mode: ${alternateFirst ? `alternating from ${firstPlayer}` : firstPlayer}`);
 console.log(`Autoplay playout: ${playout ? `enabled, max ${maxTurns} turn(s) / ${maxActions} action(s)` : "disabled"}`);
+console.log(`Autoplay policy: P1=${policySelection.P1.path ?? "baseline"}; P2=${policySelection.P2.path ?? "baseline"}`);
 console.log(`Saved summary: ${summaryPath}`);
 console.log(`Saved CSV: ${csvPath}`);
 console.log(`Saved game catalog: ${gameCatalogPath}`);
@@ -176,6 +211,86 @@ function deckPath(id) {
   const path = join(libraryDir, `${id}.json`);
   if (!existsSync(path)) throw new Error(`Saved deck not found: ${path}`);
   return path;
+}
+
+function loadSavedDeck(path) {
+  const raw = JSON.parse(readFileSync(path, "utf8"));
+  return Array.isArray(raw) ? { cards: raw } : raw;
+}
+
+function resolveSetupState(state, policy) {
+  if (pilotMulligan) {
+    const baseline = normalizePilotPolicy();
+    return resolvePilotSetup(state, {
+      P1: policy?.P1 ?? baseline,
+      P2: policy?.P2 ?? policy?.P1 ?? baseline
+    });
+  }
+  if (autoMulliganBricks) return resolveBrickMulligans(state);
+  return state;
+}
+
+function policySelectionForDecks() {
+  const p1Selection = policySelectionForDeck({
+    player: "P1",
+    deckId: p1,
+    deck: decks.P1,
+    savedDeck: savedDecks.P1,
+    explicitPath: p1PolicyPath
+  });
+  const p2Selection = policySelectionForDeck({
+    player: "P2",
+    deckId: p2,
+    deck: decks.P2,
+    savedDeck: savedDecks.P2,
+    explicitPath: p2PolicyPath
+  });
+  return { P1: p1Selection, P2: p2Selection };
+}
+
+function policySelectionForDeck({ deckId, deck, savedDeck, explicitPath }) {
+  if (explicitPath) {
+    return {
+      path: explicitPath,
+      policy: normalizePilotPolicy(loadPolicy(explicitPath)),
+      kind: "explicit"
+    };
+  }
+  const routed = resolvePolicyForDeck({
+    deck,
+    catalog,
+    savedDeck,
+    deckId,
+    policyDir,
+    fallbackPolicyPath,
+    deckLibrary: libraryDir
+  });
+  return {
+    path: routed.path,
+    policy: routed.policy,
+    kind: routed.kind,
+    profile: routed.profile
+  };
+}
+
+function loadPolicy(path) {
+  if (!path) return undefined;
+  if (!existsSync(path)) throw new Error(`Policy file not found: ${path}`);
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function resolvePolicyPath(value) {
+  if (!value) return undefined;
+  const normalized = normalizeSearch(value);
+  if (["auto", "routed", "route", "deck", "deck policy", "specialist"].includes(normalized)) return undefined;
+  if (["current", "current best", "current policy", "champion", "best"].includes(normalized)) {
+    return CURRENT_POLICY_PATH;
+  }
+  return value;
+}
+
+function normalizeSearch(value) {
+  return String(value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
 function csvFromRows(rows) {
@@ -232,7 +347,14 @@ function timestamp() {
 
 function usage() {
   console.log(`Usage:
-  node tools/batch-simulate.mjs --p1 deck-id --p2 deck-id [--games 100] [--seed n] [--random-seed] [--save-states] [--auto-mulligan-bricks] [--playout] [--max-turns 100] [--first-player P1|P2] [--alternate-first] [--no-validate]
+  node tools/batch-simulate.mjs --p1 deck-id --p2 deck-id [--games 100] [--seed n] [--random-seed] [--save-states] [--auto-mulligan-bricks] [--pilot-mulligan] [--playout] [--pilot-policy current|auto] [--opponent-policy current|auto] [--max-turns 100] [--first-player P1|P2] [--alternate-first] [--no-validate]
 
-By default this creates many shuffled opening game states with deterministic sequential seeds and writes summary.json, summary.csv, game-catalog.json, and game-catalog.csv.`);
+By default this creates many shuffled opening game states with deterministic sequential seeds and writes summary.json, summary.csv, game-catalog.json, and game-catalog.csv.
+
+Policy shortcuts:
+  --use-current-policy       Use work/private/pilot-agent/current-best-policy.json for both players.
+  --pilot-policy current     Use the current champion for P1 autoplay and pilot mulligan choices.
+  --opponent-policy current  Use the current champion for P2 autoplay and pilot mulligan choices.
+  --pilot-policy auto        Route P1 by deck set/color; this is also the default when omitted.
+  --opponent-policy auto     Route P2 by deck set/color; this is also the default when omitted.`);
 }

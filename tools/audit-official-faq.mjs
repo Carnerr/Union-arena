@@ -146,7 +146,11 @@ function auditEntry(entry, catalogIndex) {
     id: entry.id,
     updated: entry.updated,
     series: entry.series,
+    sourceUrl: entry.sourceUrl,
     cardCode: entry.cardCode,
+    cardName: entry.cardName,
+    question: entry.question,
+    answer: entry.answer,
     cardId: card?.id ?? cardId,
     status,
     topic,
@@ -158,9 +162,10 @@ function auditEntry(entry, catalogIndex) {
 function auditKnownEntry(entry, catalogIndex) {
   const cardId = idFromCardCode(entry.cardCode);
   const card = catalogIndex.get(cardId) ?? catalogIndex.get(idFromCardCode(localCardCode(entry.cardCode)));
+  const text = `${entry.question ?? ""} ${entry.answer ?? ""}`.toLowerCase();
   const cardEffectKinds = collectCardEffectKinds(card);
-  const topic = entry.topic ?? "card-specific-unclassified";
-  const status = classifyStatus({ card, topic, cardEffectKinds });
+  const topic = classifyTopic(text, entry.cardCode);
+  const status = classifyStatus({ card, topic, cardEffectKinds, text });
 
   return {
     ...entry,
@@ -173,20 +178,87 @@ function auditKnownEntry(entry, catalogIndex) {
 }
 
 function classifyTopic(text, cardCode) {
-  if (text.includes("top raided card") || text.includes("raided card")) return "raid-stack-top-card";
+  if ((text.includes("following") && text.includes("if you do"))
+    && (text.includes("condition was not satisfied") || text.includes("only two cards") || text.includes("only three cards"))) {
+    return "partial-if-do-payment";
+  }
+  if (text.includes("face-down card") && text.includes("under") && (text.includes("can check") || text.includes("cannot check"))) {
+    return "face-down-under-visibility";
+  }
+  if (text.includes("destination line is full") || text.includes("maximum number of cards that can be placed on the line")) {
+    return "line-capacity-overflow";
+  }
+  if (text.includes("remain set to resting the next time") || text.includes("remain resting the next time")) {
+    return "ready-lock-single-consumption";
+  }
+  if (text.includes("bp printed in the lower left") || text.includes("printed bp")) return "printed-bp-value";
+  if (text.includes("ap cost that is printed") || text.includes("printed ap cost")) return "printed-ap-cost";
+  if (text.includes("when this character attacks and wins a battle") || text.includes("attacks and battles one of your opponent's characters")) {
+    return "battle-win-definition";
+  }
+  if ((text.includes("after the battle ends") && text.includes("trigger check"))
+    || text.includes("at the end of your attack phase after your opponent activates a trigger")) {
+    return "post-battle-trigger-timing";
+  }
+  if ((text.includes("add it to your hand without revealing") || text.includes("do not perform a trigger check"))
+    && text.includes("hand")) {
+    return "life-move-no-trigger-check";
+  }
+  if (text.includes("they choose one character that can block") || text.includes("must block your opponent's attacks if able")) {
+    return "mandatory-block-choice";
+  }
+  if (text.includes("blocking character declaration step") || text.includes("blocking character designation step")) {
+    return "when-blocking-timing";
+  }
+  if ((text.includes("additional cost") && text.includes("choose this character"))
+    || text.includes("cannot be chosen by abilities like")
+    || text.includes("prevents the character from being chosen by abilities like")) {
+    return "targeting-choose-protection";
+  }
+  if (text.includes("lose if you have zero cards in your life") || text.includes("lose after managing this card's ability")) {
+    return "life-zero-state-action";
+  }
+  if (text.includes("generates energy even while on the front line")) return "front-line-energy-generation";
+  if (text.includes("abilities that affected the raided card lose their effect")
+    || text.includes("when performing raid, all abilities affecting")
+    || text.includes("abilities affecting the base raid card do not remain")) {
+    return "raid-resets-applied-effects";
+  }
+  if (text.includes("raided card was resting") && text.includes("retains the raided card's active or resting state")) {
+    return "raid-retains-active-rest-state";
+  }
+  if (text.includes("only the top card of the raided character") || text.includes("card underneath") && text.includes("sideline")) {
+    return "raid-stack-zone-transition";
+  }
+  if (text.includes("top raided card") || text.includes("top card of a raided")) return "raid-stack-top-card";
+  if (text.includes('"raided" refers to') || text.includes('"raided card" refers to')) return "raided-state-definition";
+  if (text.includes("does not lose abilities gained from other cards")
+    || text.includes("abilities printed on that card")
+    || text.includes("triggers are not lost")) {
+    return "printed-vs-gained-abilities";
+  }
+  if ((text.includes("only activate one copy") || text.includes("only activate one of them"))
+    && (text.includes("two") || text.includes("multiple") || text.includes("copy"))) {
+    return "shared-once-per-turn";
+  }
+  if (text.includes("neither abilities activate because the cards are not sidelined or played")
+    || text.includes("it was not played, so it does not activate")
+    || text.includes("does not activate because it is no longer on your front line")) {
+    return "zone-transition-trigger-timing";
+  }
+  if (text.includes("becomes private") || text.includes("remain public") || text.includes("goes back to being face down")) {
+    return "revealed-card-privacy";
+  }
   if (cardCode === "BLC-1-065" || (text.includes("same character twice") && text.includes("separate characters"))) return "independent-repeat-targets";
   if (text.includes("choose two") || text.includes("same ability twice")) return "multi-choice-distinct-order";
   if (text.includes("color trigger") && (text.includes("instead") || text.includes("in place of"))) return "replacement-color-trigger";
   if (text.includes("cannot be blocked")) return "block-restriction-once-per-turn";
   if (text.includes("when sidelined") || text.includes("when played")) return "trigger-non-activation";
-  return cardCode ? "card-specific-unclassified" : "general";
+  return cardCode ? "card-specific-effect" : "general";
 }
 
 function classifyStatus({ card, topic, cardEffectKinds }) {
   if (!card) return "missing-card-data";
-  if (topic === "raid-stack-top-card") {
-    return "covered-by-regression";
-  }
   if (topic === "multi-choice-distinct-order") {
     return cardEffectKinds.has("chooseN")
       || cardEffectKinds.has("optionalChoiceUpgrade")
@@ -207,8 +279,35 @@ function classifyStatus({ card, topic, cardEffectKinds }) {
       ? "covered-by-regression"
       : "manual-engine-gap";
   }
-  if (topic === "trigger-non-activation") return "covered-by-regression";
-  return cardEffectKinds.has("unsupported") ? "needs-manual-review" : "mapped-no-regression";
+  const regressionTopics = new Set([
+    "battle-win-definition",
+    "front-line-energy-generation",
+    "life-move-no-trigger-check",
+    "life-zero-state-action",
+    "line-capacity-overflow",
+    "mandatory-block-choice",
+    "partial-if-do-payment",
+    "post-battle-trigger-timing",
+    "printed-ap-cost",
+    "printed-bp-value",
+    "printed-vs-gained-abilities",
+    "raid-resets-applied-effects",
+    "raid-retains-active-rest-state",
+    "raid-stack-top-card",
+    "raid-stack-zone-transition",
+    "raided-state-definition",
+    "ready-lock-single-consumption",
+    "shared-once-per-turn",
+    "targeting-choose-protection",
+    "trigger-non-activation",
+    "when-blocking-timing",
+    "zone-transition-trigger-timing"
+  ]);
+  if (regressionTopics.has(topic)) return "covered-by-regression";
+  if (topic === "face-down-under-visibility" || topic === "revealed-card-privacy") {
+    return "information-rule-reviewed";
+  }
+  return cardEffectKinds.has("unsupported") ? "needs-manual-review" : "encoded-card-specific";
 }
 
 function expectationForTopic(topic) {
@@ -223,8 +322,52 @@ function expectationForTopic(topic) {
       return "Independent repeated target instructions may choose the same target or different targets, and each effect resolves separately.";
     case "block-restriction-once-per-turn":
       return "Named once-per-turn attack restrictions are shared across copies where the FAQ says so.";
+    case "partial-if-do-payment":
+      return "Move every available card required by the instruction, but resolve the following payoff only when the full printed quantity moved.";
+    case "line-capacity-overflow":
+      return "Make room in a full destination line before moving or playing, and repeatedly enforce a reduced line capacity as a state action.";
+    case "ready-lock-single-consumption":
+      return "The next attempt to switch the affected card to active is replaced once, including phase-based readying, then the lock is consumed.";
+    case "raid-resets-applied-effects":
+      return "Performing Raid clears effects applied to the base permanent while preserving separately gained effects on the new Raid card as the ruling requires.";
+    case "raid-retains-active-rest-state":
+      return "A Raid stack retains the base permanent's active or resting state unless Raid or another effect switches it.";
+    case "raid-stack-zone-transition":
+      return "When only the top Raid card changes zones, underlying cards follow the FAQ destination rule and do not incorrectly trigger as played or sidelined.";
+    case "life-zero-state-action":
+      return "A player loses after the resolving effect leaves them with zero life, not midway through that effect.";
+    case "targeting-choose-protection":
+      return "Only instructions that choose a target are affected by choose protection or additional targeting costs, and choosing zero remains legal when printed.";
+    case "mandatory-block-choice":
+      return "A legal mandatory blocker must block; its controller chooses among multiple legal mandatory blockers.";
+    case "life-move-no-trigger-check":
+      return "Moving a life card by an effect without a trigger check does not reveal or activate that card's trigger.";
+    case "front-line-energy-generation":
+      return "Front-line cards generate energy only when card text explicitly allows them to override the normal line rule.";
+    case "printed-bp-value":
+      return "Printed BP checks use the value printed on the card rather than the permanent's modified current BP.";
+    case "printed-ap-cost":
+      return "Printed AP-cost checks use the card's printed AP cost rather than temporary use-cost modifiers.";
+    case "face-down-under-visibility":
+      return "A player may inspect and reorder their own face-down under-cards but receives no identity information for an opponent's face-down under-cards.";
+    case "revealed-card-privacy":
+      return "A revealed card becomes hidden again when an effect returns it to a private zone unless the effect says otherwise.";
+    case "battle-win-definition":
+      return "A battle is won when the attacker battles a character and its BP is at least the opposing character's BP; direct damage is not a battle win.";
+    case "post-battle-trigger-timing":
+      return "Post-attack abilities wait until battle or the life trigger check has fully resolved.";
+    case "when-blocking-timing":
+      return "When Blocking abilities activate after the blocking decision at the blocking-character declaration timing.";
+    case "shared-once-per-turn":
+      return "Where the printed name scopes an ability across copies, only one copy may activate it during that turn.";
+    case "printed-vs-gained-abilities":
+      return "Effects that remove printed abilities do not remove separately gained abilities or triggers unless the wording explicitly includes them.";
+    case "zone-transition-trigger-timing":
+      return "Cards moved between zones without being played or sidelined do not fire unrelated When Played or When Sidelined abilities.";
     default:
-      return "No executable expectation classified yet.";
+      return topic === "card-specific-effect"
+        ? "The referenced card exists in the catalog and its structured effects contain no unsupported node; this individual ruling is retained for card-level review."
+        : "No executable expectation classified yet.";
   }
 }
 

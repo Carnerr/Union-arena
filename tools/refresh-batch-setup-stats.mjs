@@ -7,7 +7,9 @@ import {
   catalogGameResult,
   createSimulationGame,
   loadCatalogJson,
-  loadDeckJson
+  loadDeckJson,
+  normalizePilotPolicy,
+  resolvePilotSetup
 } from "../src/index.js";
 
 const root = requiredOption("--root");
@@ -25,6 +27,10 @@ for (const dir of matchups) {
     P1: loadDeckJson(join("work/private/decks", `${summary.decks.P1}.json`)),
     P2: loadDeckJson(join("work/private/decks", `${summary.decks.P2}.json`))
   };
+  const setupPolicy = {
+    P1: loadPolicy(summary.policyPaths?.P1),
+    P2: loadPolicy(summary.policyPaths?.P2)
+  };
 
   gameCatalog.rows = gameCatalog.rows.map((row, index) => {
     const setup = createSimulationGame({
@@ -34,9 +40,9 @@ for (const dir of matchups) {
       skipShuffle: summary.skipShuffle,
       validateDecks: summary.validateDecks,
       firstPlayer: row.firstPlayer,
-      setupMode: summary.autoMulliganBricks ? "manual" : "auto"
+      setupMode: summary.autoMulliganBricks || summary.pilotMulligan ? "manual" : "auto"
     });
-    const setupState = summary.autoMulliganBricks ? resolveBrickMulligans(setup.state) : setup.state;
+    const setupState = resolveSetupState(setup.state, summary, setupPolicy);
     const setupRow = catalogGameResult(setupState, { index: index + 1, seed: row.seed, statePath: row.statePath });
     return {
       ...row,
@@ -48,6 +54,10 @@ for (const dir of matchups) {
       p2Bricked: setupRow.p2Bricked,
       p1InitialBricked: setupRow.p1InitialBricked,
       p2InitialBricked: setupRow.p2InitialBricked,
+      p1SetupOpenersSeen: setupRow.p1SetupOpenersSeen,
+      p2SetupOpenersSeen: setupRow.p2SetupOpenersSeen,
+      p1InitialSetupOpenersSeen: setupRow.p1InitialSetupOpenersSeen,
+      p2InitialSetupOpenersSeen: setupRow.p2InitialSetupOpenersSeen,
       p1ZeroCostUnitsSeen: setupRow.p1ZeroCostUnitsSeen,
       p2ZeroCostUnitsSeen: setupRow.p2ZeroCostUnitsSeen,
       p1InitialZeroCostUnitsSeen: setupRow.p1InitialZeroCostUnitsSeen,
@@ -62,6 +72,18 @@ for (const dir of matchups) {
   console.log(`Refreshed setup stats for ${dir}`);
 }
 
+function resolveSetupState(state, summary, policy) {
+  if (summary.pilotMulligan) {
+    const baseline = normalizePilotPolicy();
+    return resolvePilotSetup(state, {
+      P1: policy.P1 ?? baseline,
+      P2: policy.P2 ?? policy.P1 ?? baseline
+    });
+  }
+  if (summary.autoMulliganBricks) return resolveBrickMulligans(state);
+  return state;
+}
+
 function resolveBrickMulligans(state) {
   let nextState = state;
   for (const playerId of ["P1", "P2"]) {
@@ -69,6 +91,11 @@ function resolveBrickMulligans(state) {
     nextState = applyAction(nextState, { type: actionType, player: playerId });
   }
   return nextState;
+}
+
+function loadPolicy(path) {
+  if (!path || !existsSync(path)) return null;
+  return normalizePilotPolicy(JSON.parse(readFileSync(path, "utf8")));
 }
 
 function csvFromRows(rows) {
